@@ -84,10 +84,18 @@ rx_freq = 433025000
 # If not specified, the first compatible device found is selected automatically.
 # device = "driver=plutosdr,uri=ip:192.168.42.42"
 # device = "driver=lime,serial=123456789"
+# Ettus USRP B200/B210 via UHD (needs uhd-host + soapysdr0.8-module-uhd and
+# `uhd_images_downloader -t b2xx`). Defaults: TX on TX/RX, RX on RX2, PGA 40 dB each.
+# device = "driver=uhd,serial=30AA038"
+# A B210 clone with a Kintex-7 XC7K325T refuses Ettus's FPGA image ("fx3 is in state 5");
+# point UHD at the open replacement image (see README, "USRP B210"):
+# device = "driver=uhd,serial=30AA038,fpga=/usr/share/uhd/images/b210_k7.bin"
 
 # Optional antenna selection (overrides device defaults)
-# rx_antenna = "LNAW"
+# rx_antenna = "LNAW"          # LimeSDR
 # tx_antenna = "BAND2"
+# rx_antenna = "RX2"           # USRP B2xx
+# tx_antenna = "TX/RX"
 
 ################################################################################################
 ## GAIN ELEMENTS                                                                             ##
@@ -109,6 +117,10 @@ rx_freq = 433025000
 # Example: set multiple TX gain stages
 # tx_gain_pad = 50.0
 # tx_gain_iamp = 0.0
+
+# Example: USRP B2xx has a single PGA stage (RX 0-76 dB, TX 0-89.8 dB)
+# rx_gain_pga = 40.0
+# tx_gain_pga = 40.0
 
 ###############################################################################
 

@@ -21,7 +21,7 @@ FlowStation is a fully functional **TETRA base station in software**. Plug in a 
 
 Built in Rust on top of [tetra-bluestation](https://github.com/MidnightBlueLabs/tetra-bluestation), maintained by **Razvan Zeces / YO6RZV**.
 
-**Tested hardware:** LimeSDR Mini 2.0 · Motorola MXP600 · Motorola MTM800E · Motorola MTM5400
+**Tested hardware:** LimeSDR Mini 2.0 · Ettus USRP B210 (and XC7K325T clones) · Motorola MXP600 · Motorola MTM800E · Motorola MTM5400
 
 ---
 
@@ -98,6 +98,43 @@ cp example_config/config.toml ./config.toml
 cargo build --release
 ./target/release/bluestation-bs config.toml
 ```
+
+### USRP B210 (and B200 / B210 clones)
+
+FlowStation drives a USRP through UHD's SoapySDR module. On Raspberry Pi OS / Debian:
+
+```bash
+sudo apt install uhd-host soapysdr0.8-module-uhd
+sudo uhd_images_downloader -t b2xx          # firmware + FPGA images
+# Debian's UHD looks in /usr/share/uhd/images; the downloader writes a versioned directory
+[ -d /usr/share/uhd/images ] || sudo ln -s "$(ls -d /usr/share/uhd/*/images | head -1)" /usr/share/uhd/images
+SoapySDRUtil --find="driver=uhd"            # note the serial
+```
+
+Then in `config.toml`:
+
+```toml
+[phy_io.soapysdr]
+device = "driver=uhd,serial=XXXXXXX"
+# Defaults for a B2xx: transmit on TX/RX, receive on RX2, one PGA gain stage at 40 dB.
+# Override if needed: rx_antenna / tx_antenna, rx_gain_pga (0-76) / tx_gain_pga (0-89.8).
+```
+
+Use a duplexer (or two antennas with enough isolation) between TX/RX and RX2.
+
+**Clone boards:** many low-cost "B210" boards carry a Kintex-7 XC7K325T instead of the
+Spartan-6 and refuse Ettus's FPGA image (`fx3 is in state 5` after the image loads). They
+work with the open replacement image from
+[kingjamez/B210_XC7K325T_Improvements](https://github.com/kingjamez/B210_XC7K325T_Improvements):
+
+```bash
+sudo curl -fsSL -o /usr/share/uhd/images/b210_k7.bin \
+  https://raw.githubusercontent.com/kingjamez/B210_XC7K325T_Improvements/main/release/b210_k7.bin
+printf '[serial=XXXXXXX]\nfpga=/usr/share/uhd/images/b210_k7.bin\n' | sudo tee /etc/uhd/uhd.conf
+```
+
+and `device = "driver=uhd,serial=XXXXXXX,fpga=/usr/share/uhd/images/b210_k7.bin"` in the config.
+A USB 3 port (or a powered hub) is required; the board browns out on a Pi's USB 2 ports.
 
 ### As a systemd service
 
