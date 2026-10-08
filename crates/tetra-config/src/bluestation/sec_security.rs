@@ -62,8 +62,12 @@ impl AuthenticationMode {
 ///   sckn = 1                # SCK number 1-32, as in the radios
 ///   sck_vn = 1              # SCK version number
 ///   encrypt_groups = true   # also encrypt group-addressed signalling and traffic
+///   enabled = true          # false = keep the SCK for OTAR distribution but run the cell in clear
 #[derive(Clone, PartialEq, Eq)]
 pub struct CfgAie {
+    /// false = the key is configured (and can be sent to radios over the air) but the cell
+    /// stays class 1 until it is switched on.
+    pub enabled: bool,
     pub ksg: String,
     pub sck: [u8; 10],
     pub sckn: u8,
@@ -75,8 +79,8 @@ impl fmt::Debug for CfgAie {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "CfgAie {{ ksg: {}, sck: …, sckn: {}, sck_vn: {}, encrypt_groups: {} }}",
-            self.ksg, self.sckn, self.sck_vn, self.encrypt_groups
+            "CfgAie {{ enabled: {}, ksg: {}, sck: …, sckn: {}, sck_vn: {}, encrypt_groups: {} }}",
+            self.enabled, self.ksg, self.sckn, self.sck_vn, self.encrypt_groups
         )
     }
 }
@@ -91,6 +95,8 @@ pub struct CfgAieDto {
     pub sck_vn: Option<u16>,
     #[serde(default)]
     pub encrypt_groups: Option<bool>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
 }
 
 pub fn parse_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
@@ -215,8 +221,19 @@ impl CfgSecurity {
     }
 
     /// One-line description of the air-interface encryption posture, for the startup log.
+    /// The encryption actually applied on air: the configured SCK only when it is enabled.
+    pub fn active_aie(&self) -> Option<&CfgAie> {
+        self.aie.as_ref().filter(|a| a.enabled)
+    }
+
     pub fn aie_posture(&self) -> String {
         match (&self.aie, &self.aie_error) {
+            (Some(a), _) if !a.enabled => format!(
+                "CLASS 1 (clear) — {} SCK {} (version {}) configured but encryption is OFF; the key can be sent to radios over the air",
+                a.ksg.to_uppercase(),
+                a.sckn,
+                a.sck_vn
+            ),
             (Some(a), _) => format!(
                 "CLASS 2 — {} with SCK {} (version {}), group traffic {}{}",
                 a.ksg.to_uppercase(),
@@ -325,6 +342,7 @@ pub fn apply_security_patch(dto: CfgSecurityDto) -> CfgSecurity {
             } else if let Some(sck) = parse_hex::<10>(&a.sck) {
                 (
                     Some(CfgAie {
+                        enabled: a.enabled.unwrap_or(true),
                         ksg,
                         sck,
                         sckn,
@@ -435,6 +453,7 @@ mod tests {
                 sckn: Some(3),
                 sck_vn: Some(2),
                 encrypt_groups: None,
+                enabled: None,
             }),
             ..Default::default()
         };
@@ -453,6 +472,7 @@ mod tests {
                 sckn: None,
                 sck_vn: None,
                 encrypt_groups: None,
+                enabled: None,
             }),
             ..Default::default()
         };
@@ -465,6 +485,7 @@ mod tests {
                 sckn: None,
                 sck_vn: None,
                 encrypt_groups: None,
+                enabled: None,
             }),
             ..Default::default()
         };

@@ -17,6 +17,9 @@
 
 pub mod hurdle;
 
+pub mod otar;
+pub use otar::{SSCK_LEN, ta51, ta52};
+
 use hurdle::Hurdle;
 
 /// Basic block structure BL1 (clause 5.2): the left 64-bit block is

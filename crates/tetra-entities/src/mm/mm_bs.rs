@@ -37,6 +37,9 @@ use tetra_pdus::mm::pdus::authentication::{
 };
 use tetra_pdus::mm::pdus::d_attach_detach_group_identity_acknowledgement::DAttachDetachGroupIdentityAcknowledgement;
 use tetra_security::auth::{MsChallenge, answer_ms_challenge, derive_dck, random_nonce};
+use tetra_pdus::mm::enums::otar_sub_type::{OtarRejectReason, OtarSubType, ProvisionResult};
+use tetra_pdus::mm::pdus::otar_sck::{self, DOtarSckProvide, DOtarSckReject, OtarSessionKey, SckKeyAndIdentifier, UOtarSckDemand, UOtarSckResult};
+use tetra_security::taa1::{ta41, ta51};
 use tetra_security::keys::AuthKey;
 use tetra_pdus::mm::pdus::d_location_update_accept::DLocationUpdateAccept;
 use tetra_pdus::mm::pdus::d_location_update_command::DLocationUpdateCommand;
@@ -82,6 +85,8 @@ pub struct MmBs {
     /// Derived cipher key (TB4 of DCK1/DCK2) from each radio's last successful exchange, kept
     /// for air-interface encryption once that lands.
     dck: HashMap<u32, [u8; 10]>,
+    /// SCK deliveries awaiting the radio's U-OTAR SCK RESULT.
+    otar_pending: HashMap<u32, PendingOtar>,
 }
 
 /// An authentication exchange in progress with one radio.
@@ -97,6 +102,14 @@ struct PendingAuth {
 
 /// T354 (EN 300 392-7 Annex C): how long an authentication exchange may take.
 const T354: Duration = Duration::from_secs(30);
+/// How long to wait for U-OTAR SCK RESULT after an individually addressed provide.
+const T_OTAR_RESULT: Duration = Duration::from_secs(30);
+
+struct PendingOtar {
+    sckn: u8,
+    sck_vn: u16,
+    started: Instant,
+}
 /// How long a successful authentication stays valid for the held registration to go through.
 const AUTH_PASS_GRACE: Duration = Duration::from_secs(5);
 
@@ -142,6 +155,7 @@ impl MmBs {
             auth_pending: HashMap::new(),
             auth_passed: HashMap::new(),
             dck: HashMap::new(),
+            otar_pending: HashMap::new(),
         }
     }
 
@@ -1359,7 +1373,7 @@ impl MmBs {
             MmPduTypeUl::ULocationUpdateDemand => self.rx_u_location_update_demand(queue, message),
             MmPduTypeUl::UMmStatus => self.rx_u_mm_status(queue, message),
             MmPduTypeUl::UCkChangeResult => unimplemented_log!("UCkChangeResult"),
-            MmPduTypeUl::UOtar => unimplemented_log!("UOtar"),
+            MmPduTypeUl::UOtar => self.rx_u_otar(queue, message),
             MmPduTypeUl::UInformationProvide => unimplemented_log!("UInformationProvide"),
             MmPduTypeUl::UAttachDetachGroupIdentity => self.rx_u_attach_detach_group_identity(queue, message),
             MmPduTypeUl::UAttachDetachGroupIdentityAcknowledgement => self.rx_u_attach_detach_group_identity_ack(queue, message),
@@ -2117,6 +2131,7 @@ impl TetraEntityTrait for MmBs {
 
     fn tick_start(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
         self.expire_authentication();
+        self.expire_otar();
         // Drain control commands addressed to the MM entity. We collect into a Vec first so the
         // immutable borrow on `self.control` is released before the handlers run â€” DGNA needs
         // `&mut self` (client registry, subscriber state, telemetry).
@@ -2137,6 +2152,9 @@ impl TetraEntityTrait for MmBs {
                         attach,
                     } => {
                         self.do_dgna(queue, issi, gssi, mnemonic, attachment_mode, attach);
+                    }
+                    ControlCommand::OtarSck { issi } => {
+                        self.otar_sck_provide(queue, issi, "dashboard");
                     }
                     _ => {
                         tracing::warn!("MM: ignoring unsupported control command {:?}", cmd);
@@ -2648,6 +2666,160 @@ impl MmBs {
 
     fn subscriber_key(&self, issi: u32) -> Option<AuthKey> {
         self.config.config().security.subscriber_k(issi).map(|k| AuthKey(*k))
+    }
+
+    // ───────────── OTAR: static cipher key delivery (EN 300 392-7 clause 4.5.2) ─────────────
+
+    fn notify_otar(&self, issi: u32, sckn: u8, sck_vn: u16, status: &str) {
+        if let Some(sink) = &self.telemetry {
+            sink.send(crate::net_telemetry::TelemetryEvent::OtarSck { issi, sckn, sck_vn, status: status.to_string() });
+        }
+    }
+
+    /// KSG number element (clause A.8.41) for the configured algorithm name.
+    fn ksg_number(name: &str) -> u8 {
+        match name {
+            "tea1" => 0,
+            "tea2" => 1,
+            "tea3" => 2,
+            _ => 3,
+        }
+    }
+
+    /// Send the cell's SCK to one radio, sealed under a fresh session key derived from the
+    /// radio's K (clause 4.5.2.2): KSO = TA41(K, RSO), SSCK = TA51(SCK, SCK-VN, KSO, SCKN).
+    /// Works whether or not encryption is switched on yet, so a fleet can be keyed first.
+    fn otar_sck_provide(&mut self, queue: &mut MessageQueue, issi: u32, why: &str) {
+        let cfg = self.config.config();
+        let Some(aie) = cfg.security.aie.as_ref() else {
+            tracing::warn!("MM: OTAR to ISSI {} ({}) refused — no SCK configured under [security.aie]", issi, why);
+            self.notify_otar(issi, 0, 0, "no SCK configured");
+            return;
+        };
+        let Some(k) = self.subscriber_key(issi) else {
+            tracing::warn!("MM: OTAR to ISSI {} ({}) refused — no authentication key K on file for it", issi, why);
+            self.notify_otar(issi, aie.sckn, aie.sck_vn, "no K on file for this radio");
+            return;
+        };
+        if !self.client_mgr.client_is_known(issi) {
+            tracing::warn!("MM: OTAR to ISSI {} ({}) — radio is not registered on this cell", issi, why);
+            self.notify_otar(issi, aie.sckn, aie.sck_vn, "radio not registered");
+            return;
+        }
+        let rso = random_nonce();
+        let kso = ta41(&k.0, &rso);
+        // SCKN is 0-based on air (clause A.8.70: value 0 = SCK number 1).
+        let sckn_air = aie.sckn.saturating_sub(1) & 0x1f;
+        let ssck = ta51(&aie.sck, aie.sck_vn, &kso, sckn_air);
+        let pdu = DOtarSckProvide {
+            ack_required: true,
+            explicit_response: true,
+            max_response_timer: 0,
+            session_key: OtarSessionKey::Individual { rso },
+            keys: vec![SckKeyAndIdentifier { sckn: sckn_air, sck_vn: aie.sck_vn, dmo: false, ssck }],
+            ksg_number: Self::ksg_number(&aie.ksg),
+            otar_retry_interval: 0,
+            address_extension: None,
+            proprietary: None,
+        };
+        tracing::info!("MM: OTAR ({}) — sending {} SCK {} v{} to ISSI {}", why, aie.ksg.to_uppercase(), aie.sckn, aie.sck_vn, issi);
+        self.send_auth_pdu(queue, issi, 0, "DOtarSckProvide", |b| pdu.to_bitbuf(b));
+        self.otar_pending.insert(issi, PendingOtar { sckn: aie.sckn, sck_vn: aie.sck_vn, started: Instant::now() });
+        self.notify_otar(issi, aie.sckn, aie.sck_vn, "sent");
+    }
+
+    fn rx_u_otar(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
+        let SapMsgInner::LmmMleUnitdataInd(prim) = &mut message.msg else {
+            tracing::error!("BUG: unexpected message or state -- routing error");
+            return;
+        };
+        let issi = prim.received_address.ssi;
+        let handle = prim.handle;
+        let Some(sub_type) = otar_sck::peek_sub_type(&prim.sdu) else {
+            tracing::warn!("MM: truncated U-OTAR from ISSI {}", issi);
+            return;
+        };
+        match sub_type {
+            OtarSubType::SckDemandProvide => match UOtarSckDemand::from_bitbuf(&mut prim.sdu) {
+                Ok(pdu) => self.rx_u_otar_sck_demand(queue, issi, handle, pdu),
+                Err(e) => tracing::warn!("MM: bad U-OTAR SCK DEMAND from ISSI {}: {:?}", issi, e),
+            },
+            OtarSubType::SckResultReject => match UOtarSckResult::from_bitbuf(&mut prim.sdu) {
+                Ok(pdu) => self.rx_u_otar_sck_result(issi, pdu),
+                Err(e) => tracing::warn!("MM: bad U-OTAR SCK RESULT from ISSI {}: {:?}", issi, e),
+            },
+            other => tracing::info!("MM: U-OTAR {} from ISSI {} not supported (only SCK OTAR is implemented)", other, issi),
+        }
+    }
+
+    /// The radio asks for SCK(s) by number (clause 4.5.2.1): provide ours if it is among
+    /// them, otherwise reject each requested number.
+    fn rx_u_otar_sck_demand(&mut self, queue: &mut MessageQueue, issi: u32, handle: u32, pdu: UOtarSckDemand) {
+        let cfg = self.config.config();
+        let ours = cfg.security.aie.as_ref().map(|a| (a.sckn.saturating_sub(1) & 0x1f, Self::ksg_number(&a.ksg)));
+        tracing::info!(
+            "MM: ISSI {} requests SCK(s) {:?} for KSG {}",
+            issi,
+            pdu.sckns.iter().map(|n| n + 1).collect::<Vec<_>>(),
+            pdu.ksg_number
+        );
+        match ours {
+            Some((sckn_air, ksg)) if pdu.sckns.contains(&sckn_air) && pdu.ksg_number == ksg && self.subscriber_key(issi).is_some() => {
+                self.otar_sck_provide(queue, issi, "radio request");
+            }
+            _ => {
+                let reason = match ours {
+                    Some((_, ksg)) if pdu.ksg_number != ksg => OtarRejectReason::KsgNotSupported,
+                    Some(_) if self.subscriber_key(issi).is_none() => OtarRejectReason::InvalidAddress,
+                    Some(_) => OtarRejectReason::InvalidKeyNumber,
+                    None => OtarRejectReason::KeyNotAvailable,
+                };
+                let rejected: Vec<(u8, OtarRejectReason)> = pdu.sckns.iter().take(7).map(|n| (*n, reason)).collect();
+                if rejected.is_empty() {
+                    return;
+                }
+                tracing::info!("MM: rejecting SCK request from ISSI {}: {:?}", issi, reason);
+                let reject = DOtarSckReject { rejected, otar_retry_interval: 0, address_extension: None };
+                self.send_auth_pdu(queue, issi, handle, "DOtarSckReject", |b| reject.to_bitbuf(b));
+            }
+        }
+    }
+
+    /// The radio reports whether it could unseal and store the key.
+    fn rx_u_otar_sck_result(&mut self, issi: u32, pdu: UOtarSckResult) {
+        let pending = self.otar_pending.remove(&issi);
+        for r in &pdu.results {
+            let sckn = r.sckn + 1;
+            let vn = pending.as_ref().map(|p| p.sck_vn).unwrap_or(0);
+            match r.result {
+                ProvisionResult::Accepted => {
+                    tracing::info!("MM: ISSI {} accepted SCK {} (version {})", issi, sckn, vn);
+                    self.notify_otar(issi, sckn, vn, "accepted");
+                }
+                other => {
+                    let detail = match r.current_sck_vn {
+                        Some(cur) => format!("{} (radio holds version {})", other.describe(), cur),
+                        None => other.describe().to_string(),
+                    };
+                    tracing::warn!("MM: ISSI {} did not take SCK {}: {}", issi, sckn, detail);
+                    self.notify_otar(issi, sckn, vn, &format!("failed: {detail}"));
+                }
+            }
+        }
+    }
+
+    fn expire_otar(&mut self) {
+        let expired: Vec<(u32, u8, u16)> = self
+            .otar_pending
+            .iter()
+            .filter(|(_, p)| p.started.elapsed() > T_OTAR_RESULT)
+            .map(|(i, p)| (*i, p.sckn, p.sck_vn))
+            .collect();
+        for (issi, sckn, vn) in expired {
+            tracing::warn!("MM: no U-OTAR SCK RESULT from ISSI {} for SCK {} within {:?}", issi, sckn, T_OTAR_RESULT);
+            self.otar_pending.remove(&issi);
+            self.notify_otar(issi, sckn, vn, "timeout: no result from the radio");
+        }
     }
 
     /// Reject the registration that was held for an authentication that failed.

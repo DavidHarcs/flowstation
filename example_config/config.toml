@@ -404,6 +404,28 @@ voice_service = true
 #
 # [security]
 # issi_whitelist = [2260571, 2260572, 2260575]
+#
+# Authentication (ETSI EN 300 392-7 clause 4, TAA1): challenge radios with their 128-bit
+# key K when they register. off | optional | required. Fine on amateur allocations.
+# authentication = "required"
+# mutual_authentication = true
+#
+# One entry per radio — the K programmed into it with its programming software / KVL:
+# [[security.subscribers]]
+# issi = 2260571
+# k = "00112233445566778899aabbccddeeff"
+#
+# Air-interface encryption (class 2, clause 6): one static cipher key shared by all radios.
+# NOT permitted under amateur licences — licensed private networks only.
+# With enabled = false the key is kept only for over-the-air delivery (dashboard → Security →
+# "Send SCK", clause 4.5.2 OTAR) and the cell stays in clear; set true once every radio has it.
+# [security.aie]
+# enabled = false
+# ksg = "tea3"                    # tea1 | tea2 | tea3 — TEA1 keeps only 32 key bits (research only)
+# sck = "00112233445566778899"    # 80-bit static cipher key, 20 hex digits
+# sckn = 1                        # SCK number 1-32
+# sck_vn = 1                      # SCK version number
+# encrypt_groups = true
 
 ###############################################################################
 

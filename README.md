@@ -197,6 +197,40 @@ password = "your_password"
 issi_whitelist = [2260571, 2260572]   # Only these ISSIs can register
 ```
 
+### Authentication and air-interface encryption
+
+FlowStation implements the TETRA security procedures of ETSI EN 300 392-7 with the
+algorithms ETSI published in 2024 (TAA1, TEA1/TEA2/TEA3), all checked against independent
+test vectors. Everything below is also editable from the dashboard's **Security** page.
+
+```toml
+[security]
+authentication = "required"      # off | optional | required — challenge radios with their key K
+mutual_authentication = true
+
+[[security.subscribers]]         # one per radio: the 128-bit K programmed into it
+issi = 2260571
+k = "00112233445566778899aabbccddeeff"
+
+[security.aie]                   # static cipher key for a class 2 cell
+enabled = false                  # false = key staged for over-the-air delivery, cell still in clear
+ksg = "tea3"                     # tea1 | tea2 | tea3  (TEA1 is broken — research only)
+sck = "00112233445566778899"     # 80-bit SCK
+sckn = 1                         # SCK number 1-32
+sck_vn = 1                       # SCK version
+encrypt_groups = true
+```
+
+**Rolling out encryption without cables:** load each radio's K once with its programming
+software, add it under `[[security.subscribers]]`, configure the SCK with `enabled = false`,
+then on the Security page press **Send SCK** for each registered radio (OTAR, clause 4.5.2).
+When every radio reports the key as accepted, switch `enabled = true` and restart. Radios
+that still miss the key cannot register on a class 2 cell.
+
+Authentication is an access-control handshake and is fine on amateur allocations.
+Air-interface *encryption* is not permitted under amateur licences — enable it only on a
+licensed private network.
+
 ### Home Mode Display (callsign on radio screen)
 
 ```toml

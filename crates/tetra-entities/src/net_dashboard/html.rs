@@ -3571,7 +3571,10 @@ tbody tr:hover td{background:color-mix(in srgb,var(--bg3) 70%, transparent);}
       </div>
 
       <div class="card">
-        <div class="card-head"><div class="card-title" data-i18n="secp_keys_title">Subscriber keys</div></div>
+        <div class="card-head">
+          <div class="card-title" data-i18n="secp_keys_title">Subscriber keys</div>
+          <div class="card-actions"><button class="btn btn-sm" onclick="secpSendSckAll()" title="" data-i18n-title="secp_otar_hint"><span data-i18n="secp_otar_send_all">Send SCK to all online radios</span></button></div>
+        </div>
         <div class="card-body">
           <div class="help-text" style="margin-bottom:12px" data-i18n="secp_keys_help"></div>
           <div class="table-wrap">
@@ -3595,7 +3598,8 @@ tbody tr:hover td{background:color-mix(in srgb,var(--bg3) 70%, transparent);}
         <div class="card-head"><div class="card-title" data-i18n="secp_aie_title">Air-interface encryption (class 2)</div></div>
         <div class="card-body">
           <div class="help-text" style="margin-bottom:8px" data-i18n="secp_aie_help"></div>
-          <label class="sw-row"><span class="sw-text" data-i18n="secp_aie_enable">Enable encryption</span><span class="sw"><input type="checkbox" id="secp-aie" onchange="secpAieToggle()"><i></i></span></label>
+          <label class="sw-row"><span class="sw-text" data-i18n="secp_aie_enable">Encrypt the cell (class 2)</span><span class="sw"><input type="checkbox" id="secp-aie" onchange="secpAieToggle()"><i></i></span></label>
+          <div class="help-text" style="margin-top:6px" data-i18n="secp_aie_staging"></div>
           <div id="secp-aie-fields" style="margin-top:12px">
             <div class="form-row">
               <label class="help-text" style="display:block;margin-bottom:4px" data-i18n="secp_ksg">Algorithm (KSG)</label>
@@ -4430,7 +4434,9 @@ const LANGS={
     secp_mutual:'Mutual authentication (answer the radio\'s challenge and challenge back)',secp_keys_title:'Subscriber keys',secp_keys_help:'One K per radio, 32 hex digits, identical to the key programmed into the radio with its KVL / programming software.',
     secp_th_issi:'ISSI',secp_th_k:'Key K',secp_no_keys:'No subscriber keys',secp_add:'Add',secp_generate:'Generate',secp_remove:'Remove',secp_k_placeholder:'32 hex digits',secp_issi_placeholder:'ISSI',
     secp_aie_title:'Air-interface encryption (class 2)',secp_aie_help:'Encrypt all signalling and speech on this cell with a static cipher key (SCK) shared by every radio. Radios without the key cannot register or hear traffic. Air-interface encryption is not permitted under amateur licences — enable it only on a licensed private network.',
-    secp_aie_enable:'Enable encryption',secp_ksg:'Algorithm (KSG)',secp_sck:'Static cipher key (SCK)',secp_sck_placeholder:'20 hex digits',secp_sckn:'SCK number (1-32)',secp_sckvn:'SCK version',secp_groups:'Also encrypt group calls and group signalling',
+    secp_aie_enable:'Encrypt the cell (class 2)',secp_aie_staging:'Leave this off while you distribute the key: with it off the SCK below is only used for over-the-air delivery and the cell stays in clear. Switch it on once every radio reports the key as accepted.',
+    secp_staged:'(staged for OTAR)',secp_otar_label:'OTAR',secp_otar_send:'Send SCK',secp_otar_send_all:'Send SCK to all online radios',secp_otar_hint:'Deliver the SCK over the air, sealed under this radio\'s K (needs the radio registered and its K on file)',
+    secp_otar_none:'No online radio with a saved key',secp_otar_confirm_all:'Send the SCK to {n} radio(s)?',secp_save_first:'Save your changes first',secp_offline:'offline',secp_ksg:'Algorithm (KSG)',secp_sck:'Static cipher key (SCK)',secp_sck_placeholder:'20 hex digits',secp_sckn:'SCK number (1-32)',secp_sckvn:'SCK version',secp_groups:'Also encrypt group calls and group signalling',
     secp_tea1_warn:'TEA1 is broken: it keeps only 32 of its 80 key bits and the key can be recovered from a few seconds of traffic. Use it for research or to talk to TEA1-only radios, never for protection.',
     secp_keep:'unchanged',secp_saved_ok:'Saved. Restart the station to apply.',secp_invalid_keys:'Keys on file that could not be parsed (ISSI): ',
     secp_algo_title:'Algorithms in this build',secp_th_algo:'Algorithm',secp_th_status:'Status',secp_th_note:'Notes',secp_available:'Available',secp_unavailable:'Not available',secp_weak:'Weak — research only',
@@ -5560,6 +5566,8 @@ function handleMsg(msg){
       renderStations();renderDgnaPage();break;
     case 'ms_deregistered':
       delete state.ms[msg.issi];delete state.secByIssi[msg.issi];renderStations();renderDgnaPage();break;
+    case 'otar_sck':
+      secpOtar[msg.issi]=msg.status;if(document.getElementById('page-security').classList.contains('active'))secpRenderSubs();break;
     case 'ms_security':{
       // Authentication completes before the registration that creates the MS row, so the
       // flags are kept per ISSI and merged into the row when it appears.
@@ -7018,20 +7026,38 @@ function tgEsc(s){return (s||'').toString().replace(/&/g,'&amp;').replace(/</g,'
 // The token to send: a freshly-typed value (never the masked placeholder), else '' = keep saved.
 function tgTokenField(){const v=(document.getElementById('tg-token').value||'').trim();return (tgTokenDirty&&v&&!v.includes('…'))?v:'';}
 // ── Security page ─────────────────────────────────────────────────────────────
-let secpData=null,secpSubs=[],secpSckDirty=false,secpChanged=false;
+let secpData=null,secpSubs=[],secpSckDirty=false,secpChanged=false,secpOtar={};
 function secpEsc(s){return (s||'').toString().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function secpMsg(txt,ok,id){const el=document.getElementById(id||'secp-msg');el.textContent=txt;el.style.color=ok?'var(--accent)':'var(--danger)';if(ok)setTimeout(()=>{if(el.textContent===txt)el.textContent='';},6000);}
 function secpDirty(){secpChanged=true;const el=document.getElementById('secp-msg');el.textContent=t('secp_unsaved');el.style.color='var(--warn)';}
 function secpPosture(p){
   if(!p)return '—';
   const a={off:t('secp_auth_off').split(' — ')[0],optional:t('secp_auth_optional').split(' — ')[0],required:t('secp_auth_required').split(' — ')[0]}[p.authentication]||p.authentication;
-  const enc=p.aie?`${p.aie.ksg.toUpperCase()} · SCK ${p.aie.sckn} v${p.aie.sck_vn}${p.aie.weak?' ⚠':''}`:t('sec_cell_clear');
-  return `<span style="color:${p.aie?(p.aie.weak?'var(--warn)':'var(--accent)'):'var(--text2)'}">${ICON_LOCK} ${secpEsc(enc)}</span><br><span style="color:var(--text2)">AUTH ${secpEsc(a).toUpperCase()}${p.mutual_authentication&&p.authentication!=='off'?' · mutual':''} · ${(p.subscribers||[]).length} key(s)</span>`;
+  const on=!!(p.aie&&p.aie.enabled);
+  const enc=on?`${p.aie.ksg.toUpperCase()} · SCK ${p.aie.sckn} v${p.aie.sck_vn}${p.aie.weak?' ⚠':''}`:(p.aie?`${t('sec_cell_clear')} · ${p.aie.ksg.toUpperCase()} SCK ${p.aie.sckn} v${p.aie.sck_vn} ${t('secp_staged')}`:t('sec_cell_clear'));
+  return `<span style="color:${on?(p.aie.weak?'var(--warn)':'var(--accent)'):'var(--text2)'}">${ICON_LOCK} ${secpEsc(enc)}</span><br><span style="color:var(--text2)">AUTH ${secpEsc(a).toUpperCase()}${p.mutual_authentication&&p.authentication!=='off'?' · mutual':''} · ${(p.subscribers||[]).length} key(s)</span>`;
 }
 function secpRenderSubs(){
   const tb=document.getElementById('secp-subs');
   if(!secpSubs.length){tb.innerHTML=`<tr><td colspan="3" class="help-text">${t('secp_no_keys')}</td></tr>`;return;}
-  tb.innerHTML=secpSubs.map((s,i)=>`<tr><td>${idCell?idCell(s.issi):s.issi}</td><td style="font-family:var(--mono)">${s.k==='keep'?secpEsc(s.k_masked)+' <span class="badge badge-dim" style="font-size:9px">'+t('secp_keep')+'</span>':secpEsc(s.k.slice(0,4))+'…'+secpEsc(s.k.slice(-4))+' <span class="badge badge-green" style="font-size:9px">NEW</span>'}</td><td><button class="btn btn-sm btn-danger" onclick="secpRemoveSub(${i})">${t('secp_remove')}</button></td></tr>`).join('');
+  const canOtar=!!(secpData&&(secpData.saved||secpData.running)&&(secpData.saved||secpData.running).aie);
+  tb.innerHTML=secpSubs.map((s,i)=>{
+    const st=secpOtar[s.issi],ok=st==='accepted',pend=st==='sent';
+    const stHtml=st?`<div style="font-size:11px;margin-top:3px;color:${ok?'var(--accent)':(pend?'var(--text2)':'var(--danger)')}">${ICON_LOCK} ${t('secp_otar_label')}: ${secpEsc(st)}</div>`:'';
+    const online=!!state.ms[s.issi];
+    return `<tr><td>${idCell?idCell(s.issi):s.issi}${online?'':' <span class="badge badge-dim" style="font-size:9px">'+t('secp_offline')+'</span>'}</td><td style="font-family:var(--mono)">${s.k==='keep'?secpEsc(s.k_masked)+' <span class="badge badge-dim" style="font-size:9px">'+t('secp_keep')+'</span>':secpEsc(s.k.slice(0,4))+'…'+secpEsc(s.k.slice(-4))+' <span class="badge badge-green" style="font-size:9px">NEW</span>'}${stHtml}</td><td style="white-space:nowrap"><button class="btn btn-sm" ${(canOtar&&s.k==='keep'&&online)?'':'disabled'} title="${t('secp_otar_hint')}" onclick="secpSendSck(${s.issi})">${ICON_LOCK} ${t('secp_otar_send')}</button> <button class="btn btn-sm btn-danger" onclick="secpRemoveSub(${i})">${t('secp_remove')}</button></td></tr>`;
+  }).join('');
+}
+function secpSendSck(issi){
+  if(secpChanged){secpMsg(t('secp_save_first'),false,'secp-subs-msg');return;}
+  if(!wsSend({type:'otar_sck',issi})){secpMsg(t('conn_error'),false,'secp-subs-msg');return;}
+  secpOtar[issi]='sent';secpRenderSubs();
+}
+function secpSendSckAll(){
+  const targets=secpSubs.filter(s=>s.k==='keep'&&state.ms[s.issi]);
+  if(!targets.length){secpMsg(t('secp_otar_none'),false,'secp-subs-msg');return;}
+  if(!confirm(t('secp_otar_confirm_all',{n:targets.length})))return;
+  targets.forEach((s,i)=>setTimeout(()=>secpSendSck(s.issi),i*1500));
 }
 function secpAddSub(){
   const issi=parseInt(document.getElementById('secp-sub-issi').value,10);
@@ -7048,7 +7074,7 @@ async function secpGenerate(what,inputId){
     if(!r.ok){secpMsg(await r.text(),false);return;}const d=await r.json();document.getElementById(inputId).value=d.hex||'';}
   catch{secpMsg(t('conn_error'),false);}
 }
-function secpAieToggle(){document.getElementById('secp-aie-fields').style.display=document.getElementById('secp-aie').checked?'':'none';secpDirty();}
+function secpAieToggle(){secpDirty();}
 function secpKsgChanged(){
   const sel=document.getElementById('secp-ksg'),id=sel.value,k=(secpData&&secpData.ksgs||[]).find(x=>x.id===id);
   document.getElementById('secp-ksg-note').textContent=k?k.note:'';
@@ -7076,8 +7102,7 @@ function secpFill(d){
   const sel=document.getElementById('secp-ksg');
   sel.innerHTML=(d.ksgs||[]).map(k=>`<option value="${k.id}"${k.available?'':' disabled'}>${k.name}${k.weak?' — research only':''}${k.available?'':' — not available'}</option>`).join('');
   const aie=s.aie;
-  document.getElementById('secp-aie').checked=!!aie;
-  document.getElementById('secp-aie-fields').style.display=aie?'':'none';
+  document.getElementById('secp-aie').checked=!!(aie&&aie.enabled);
   sel.value=aie?aie.ksg:'tea3';
   document.getElementById('secp-sck').value=aie?aie.sck_masked:'';secpSckDirty=false;
   document.getElementById('secp-sckn').value=aie?aie.sckn:1;
@@ -7097,12 +7122,14 @@ async function loadSecurity(){
 async function saveSecurity(){
   const enabled=document.getElementById('secp-aie').checked;
   const sck=(document.getElementById('secp-sck').value||'').trim().toLowerCase();
-  if(enabled&&secpSckDirty&&!/^[0-9a-f]{20}$/.test(sck)){secpMsg('SCK: '+t('secp_sck_placeholder'),false);return;}
+  const haveKey=secpSckDirty?sck.length>0:!!((secpData.saved||secpData.running).aie);
+  if(secpSckDirty&&sck&&!/^[0-9a-f]{20}$/.test(sck)){secpMsg('SCK: '+t('secp_sck_placeholder'),false);return;}
+  if(enabled&&!haveKey){secpMsg('SCK: '+t('secp_sck_placeholder'),false);return;}
   const body={
     authentication:document.getElementById('secp-auth').value,
     mutual_authentication:document.getElementById('secp-mutual').checked,
     subscribers:secpSubs.map(s=>({issi:s.issi,k:s.k})),
-    aie:enabled?{enabled:true,ksg:document.getElementById('secp-ksg').value,sck:secpSckDirty?sck:'keep',
+    aie:haveKey?{enabled,ksg:document.getElementById('secp-ksg').value,sck:secpSckDirty?sck:'keep',
       sckn:parseInt(document.getElementById('secp-sckn').value,10)||1,sck_vn:parseInt(document.getElementById('secp-sckvn').value,10)||0,
       encrypt_groups:document.getElementById('secp-groups').checked}:{enabled:false}
   };

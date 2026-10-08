@@ -23,6 +23,7 @@ pub struct SecurityEdit {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AieEdit {
+    pub enabled: bool,
     pub ksg: String,
     pub sck: [u8; 10],
     pub sckn: u8,
@@ -63,7 +64,7 @@ fn parse_auth(s: &str) -> Result<AuthenticationMode, String> {
 /// One security posture as the browser sees it (keys masked).
 pub fn posture_json(sec: &CfgSecurity) -> serde_json::Value {
     serde_json::json!({
-        "class": if sec.aie.is_some() { 2 } else { 1 },
+        "class": if sec.active_aie().is_some() { 2 } else { 1 },
         "authentication": auth_str(sec.authentication),
         "mutual_authentication": sec.mutual_authentication,
         "subscribers": sec.subscribers.iter().map(|s| serde_json::json!({
@@ -71,7 +72,7 @@ pub fn posture_json(sec: &CfgSecurity) -> serde_json::Value {
         })).collect::<Vec<_>>(),
         "invalid_subscriber_keys": sec.invalid_subscriber_keys,
         "aie": sec.aie.as_ref().map(|a| serde_json::json!({
-            "ksg": a.ksg, "sck_masked": mask_key(&a.sck), "sckn": a.sckn, "sck_vn": a.sck_vn,
+            "enabled": a.enabled, "ksg": a.ksg, "sck_masked": mask_key(&a.sck), "sckn": a.sckn, "sck_vn": a.sck_vn,
             "encrypt_groups": a.encrypt_groups, "weak": a.ksg == "tea1",
         })),
         "aie_error": sec.aie_error,
@@ -164,6 +165,7 @@ pub fn parse_edit(body: &str, current: &CfgSecurity) -> Result<SecurityEdit, Str
 
     let aie = match json.get("aie") {
         None => current.aie.as_ref().map(|a| AieEdit {
+            enabled: a.enabled,
             ksg: a.ksg.clone(),
             sck: a.sck,
             sckn: a.sckn,
@@ -172,7 +174,10 @@ pub fn parse_edit(body: &str, current: &CfgSecurity) -> Result<SecurityEdit, Str
         }),
         Some(serde_json::Value::Null) => None,
         Some(a) => {
-            if !a.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true) {
+            let enabled = a.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+            let sck_given = a.get("sck").and_then(|v| v.as_str()).map(|s| s != KEEP && !s.trim().is_empty()).unwrap_or(false);
+            if !enabled && !sck_given && current.aie.is_none() {
+                // Switched off with no key on file or entered: nothing to keep.
                 None
             } else {
                 let ksg = a
@@ -199,6 +204,7 @@ pub fn parse_edit(body: &str, current: &CfgSecurity) -> Result<SecurityEdit, Str
                     return Err("SCK version must be 0-65535".into());
                 }
                 Some(AieEdit {
+                    enabled,
                     ksg,
                     sck,
                     sckn: sckn as u8,
@@ -258,6 +264,7 @@ pub fn render_toml(original: &str, edit: &SecurityEdit) -> String {
             String::new(),
             "# Air-interface encryption, security class 2 (written by the dashboard).".to_string(),
             "[security.aie]".to_string(),
+            format!("enabled = {}", a.enabled),
             format!("ksg = \"{}\"", a.ksg),
             format!("sck = \"{}\"", hex(&a.sck)),
             format!("sckn = {}", a.sckn),
@@ -370,7 +377,7 @@ mod tests {
             authentication: AuthenticationMode::Required,
             mutual_authentication: true,
             subscribers: vec![(2358245, [0x11; 16])],
-            aie: Some(AieEdit { ksg: "tea3".into(), sck: [0x22; 10], sckn: 3, sck_vn: 4, encrypt_groups: false }),
+            aie: Some(AieEdit { enabled: true, ksg: "tea3".into(), sck: [0x22; 10], sckn: 3, sck_vn: 4, encrypt_groups: false }),
         }
     }
 
@@ -407,13 +414,19 @@ mod tests {
     }
 
     #[test]
-    fn disabling_encryption_drops_the_table() {
+    fn disabling_encryption_keeps_the_key_staged() {
         let mut e = edit();
+        e.aie.as_mut().unwrap().enabled = false;
+        let out = render_toml(BASE, &e);
+        assert!(out.contains("[security.aie]\nenabled = false"));
+        let cfg = tetra_config::bluestation::from_toml_str(&out).expect("parses");
+        assert!(cfg.security.aie.is_some(), "key kept for OTAR");
+        assert!(cfg.security.active_aie().is_none(), "cell runs in clear");
+        // No key at all: the table goes.
         e.aie = None;
         let out = render_toml(BASE, &e);
         assert!(!out.contains("[security.aie]"));
-        let cfg = tetra_config::bluestation::from_toml_str(&out).expect("parses");
-        assert!(cfg.security.aie.is_none());
+        assert!(tetra_config::bluestation::from_toml_str(&out).unwrap().security.aie.is_none());
     }
 
     #[test]
@@ -430,7 +443,10 @@ mod tests {
         assert!(parse_edit(r#"{"subscribers":[{"issi":8,"k":"keep"}]}"#, &current).is_err());
         assert!(parse_edit(r#"{"subscribers":[{"issi":8,"k":"zz"}]}"#, &current).is_err());
         assert!(parse_edit(r#"{"aie":{"ksg":"tea4","sck":"keep"}}"#, &current).is_err());
-        assert!(parse_edit(r#"{"aie":{"enabled":false}}"#, &current).unwrap().aie.is_none());
+        let off = parse_edit(r#"{"aie":{"enabled":false}}"#, &current).unwrap().aie.unwrap();
+        assert!(!off.enabled && off.sck == [0u8; 10], "disabled but the file's key is kept");
+        let bare = tetra_config::bluestation::from_toml_str(HEAD).unwrap().security;
+        assert!(parse_edit(r#"{"aie":{"enabled":false}}"#, &bare).unwrap().aie.is_none());
     }
 
     #[test]

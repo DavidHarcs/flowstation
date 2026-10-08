@@ -230,6 +230,9 @@ pub enum TelemetryEvent {
     /// decrypted a PDU it sent under the cell's static cipher key. `None` leaves that flag as it
     /// was. Appended last for bitcode wire-stability.
     MsSecurity { issi: u32, authenticated: Option<bool>, encrypting: Option<bool> },
+    /// Progress of an over-the-air SCK delivery to a radio: "sent", "accepted", a failure
+    /// text, or "timeout". Appended last for bitcode wire-stability.
+    OtarSck { issi: u32, sckn: u8, sck_vn: u16, status: String },
 }
 
 /// A single host-system sensor reading. Kept flat for easy JSON serialisation

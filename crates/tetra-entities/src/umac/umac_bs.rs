@@ -206,7 +206,7 @@ impl UmacBs {
             class1_supported: true,
             class2_supported: true,
             class3_supported: false,
-            sck_n: Some(c.security.aie.as_ref().map(|a| a.sckn).unwrap_or(0)),
+            sck_n: Some(c.security.active_aie().map(|a| a.sckn.saturating_sub(1)).unwrap_or(0)),
             dck_retrieval_during_cell_select: None,
             dck_retrieval_during_cell_reselect: None,
             linked_gck_crypto_periods: None,

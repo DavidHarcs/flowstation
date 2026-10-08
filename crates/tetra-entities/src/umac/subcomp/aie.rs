@@ -29,7 +29,7 @@ impl std::fmt::Debug for AieCell {
 impl AieCell {
     /// Build from the configuration, or `None` for a class 1 (clear) cell.
     pub fn from_config(cfg: &StackConfig) -> Option<Arc<AieCell>> {
-        let aie = cfg.security.aie.as_ref()?;
+        let aie = cfg.security.active_aie()?;
         let ksg = match aie.ksg.as_str() {
             "tea1" => KsgId::Tea1,
             "tea2" => KsgId::Tea2,

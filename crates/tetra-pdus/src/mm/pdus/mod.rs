@@ -1,4 +1,5 @@
 pub mod authentication;
+pub mod otar_sck;
 pub mod d_attach_detach_group_identity;
 pub mod d_attach_detach_group_identity_acknowledgement;
 pub mod d_location_update_accept;

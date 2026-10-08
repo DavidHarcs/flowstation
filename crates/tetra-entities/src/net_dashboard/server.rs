@@ -1018,6 +1018,10 @@ impl DashboardServer {
                     );
                     s.push_log("INFO", format!("MS {} registered", issi));
                 }
+                TelemetryEvent::OtarSck { issi, sckn, sck_vn, status } => {
+                    let level = if status == "accepted" || status == "sent" { "INFO" } else { "WARN" };
+                    s.push_log(level, format!("OTAR SCK {} v{} to ISSI {}: {}", sckn, sck_vn, issi, status));
+                }
                 TelemetryEvent::MsSecurity { issi, authenticated, encrypting } => {
                     let flags = s.ms_security.entry(*issi).or_default();
                     if let Some(a) = authenticated {
@@ -1464,15 +1468,16 @@ fn cell_security_json(sec: &tetra_config::bluestation::sec_security::CfgSecurity
         AuthenticationMode::Optional => "optional",
         AuthenticationMode::Required => "required",
     };
-    match &sec.aie {
-        Some(a) => serde_json::json!({
+    match (&sec.aie, sec.active_aie()) {
+        (_, Some(a)) => serde_json::json!({
             "class": 2, "ksg": a.ksg.to_uppercase(), "sckn": a.sckn, "sck_vn": a.sck_vn,
             "weak": a.ksg == "tea1", "encrypt_groups": a.encrypt_groups,
             "authentication": authentication, "mutual": sec.mutual_authentication,
             "subscribers": sec.subscribers.len(),
         }),
-        None => serde_json::json!({
+        (staged, None) => serde_json::json!({
             "class": 1, "aie_error": sec.aie_error,
+            "staged": staged.as_ref().map(|a| serde_json::json!({"ksg": a.ksg.to_uppercase(), "sckn": a.sckn, "sck_vn": a.sck_vn})),
             "authentication": authentication, "mutual": sec.mutual_authentication,
             "subscribers": sec.subscribers.len(),
         }),
@@ -1503,6 +1508,9 @@ fn event_to_ws_msg(event: &TelemetryEvent) -> Option<String> {
         TelemetryEvent::MsEnergySaving { issi, mode } => serde_json::json!({"type":"ms_energy_saving","issi":issi,"mode":mode}),
         TelemetryEvent::MsSecurity { issi, authenticated, encrypting } => {
             serde_json::json!({"type":"ms_security","issi":issi,"authenticated":authenticated,"encrypting":encrypting})
+        }
+        TelemetryEvent::OtarSck { issi, sckn, sck_vn, status } => {
+            serde_json::json!({"type":"otar_sck","issi":issi,"sckn":sckn,"sck_vn":sck_vn,"status":status})
         }
         TelemetryEvent::GroupCallStarted {
             call_id,
@@ -2787,6 +2795,18 @@ fn handle_ws_command(
     };
 
     match cmd_type {
+        Some("otar_sck") => {
+            let Some(issi) = json_ssi(&v, "issi") else {
+                reject_ws_ssi(state, "otar_sck", "issi", v.get("issi"));
+                return;
+            };
+            tracing::info!("Dashboard: OTAR SCK to ISSI {}", issi);
+            if !send_cmd(ControlCommand::OtarSck { issi }) {
+                tracing::warn!("Dashboard: no control dispatcher for otar_sck");
+            }
+            let mut s = state.write().unwrap();
+            s.push_log("INFO", format!("OTAR: sending SCK to ISSI {}", issi));
+        }
         Some("kick") => {
             let Some(issi) = json_ssi(&v, "issi") else {
                 reject_ws_ssi(state, "kick", "issi", v.get("issi"));

@@ -12,6 +12,7 @@ pub mod reject_cause;
 
 pub mod authentication_reject_reason;
 pub mod authentication_sub_type;
+pub mod otar_sub_type;
 
 pub mod type34_elem_id_dl;
 pub mod type34_elem_id_ul;
