@@ -86,10 +86,10 @@ rx_freq = 433025000
 # device = "driver=lime,serial=123456789"
 # Ettus USRP B200/B210 via UHD (needs uhd-host + soapysdr0.8-module-uhd and
 # `uhd_images_downloader -t b2xx`). Defaults: TX on TX/RX, RX on RX2, PGA 40 dB each.
-# device = "driver=uhd,serial=30AA038"
+# device = "driver=uhd,serial=XXXXXXX"
 # A B210 clone with a Kintex-7 XC7K325T refuses Ettus's FPGA image ("fx3 is in state 5");
 # point UHD at the open replacement image (see README, "USRP B210"):
-# device = "driver=uhd,serial=30AA038,fpga=/usr/share/uhd/images/b210_k7.bin"
+# device = "driver=uhd,serial=XXXXXXX,fpga=/usr/share/uhd/images/b210_k7.bin"
 
 # Optional antenna selection (overrides device defaults)
 # rx_antenna = "LNAW"          # LimeSDR
