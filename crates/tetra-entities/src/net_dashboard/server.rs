@@ -2333,6 +2333,21 @@ fn handle_connection(
     } else if req_line.contains("POST /api/telegram/test") {
         let (inner, body_str) = read_post_body(stream);
         serve_telegram_test(inner, &shared_config, &body_str);
+    } else if req_line.contains("POST /api/security/generate") {
+        let (inner, body_str) = read_post_body(stream);
+        serve_security_generate(inner, &body_str);
+    } else if req_line.contains("POST /api/security/restart") {
+        let (inner, _) = read_post_body(stream);
+        tracing::info!("Dashboard: restart requested from the Security page");
+        crate::service_control::schedule_service_action(crate::service_control::ServiceAction::Restart, std::time::Duration::from_secs(2));
+        http_json_response(inner, 200, "{\"ok\":true}");
+    } else if req_line.contains("GET /api/security") {
+        let mut s = stream;
+        drain_http_headers(&mut s);
+        serve_security_get(s, &shared_config, &config_path);
+    } else if req_line.contains("POST /api/security") {
+        let (inner, body_str) = read_post_body(stream);
+        serve_security_post(inner, &shared_config, &config_path, &body_str);
     } else if req_line.contains("GET /api/telegram") {
         let mut s = stream;
         drain_http_headers(&mut s);
@@ -3617,6 +3632,70 @@ fn serve_telegram_post(stream: TcpStream, shared_config: &Option<tetra_config::b
         ov.chat_ids.len()
     );
     http_response(stream, 200, "OK");
+}
+
+/// GET /api/security — running and saved security posture, keys masked.
+fn serve_security_get(stream: TcpStream, shared_config: &Option<tetra_config::bluestation::SharedConfig>, config_path: &str) {
+    use crate::net_dashboard::security;
+    let running = match shared_config {
+        Some(cfg) => cfg.config().security.clone(),
+        None => tetra_config::bluestation::sec_security::CfgSecurity::default(),
+    };
+    http_json_response(stream, 200, &security::page_json(&running, security::load_saved(config_path)));
+}
+
+/// POST /api/security — validate and write the settings; they apply on the next restart.
+fn serve_security_post(stream: TcpStream, shared_config: &Option<tetra_config::bluestation::SharedConfig>, config_path: &str, body: &str) {
+    use crate::net_dashboard::security;
+    let current = match security::load_saved(config_path) {
+        Ok(s) => s,
+        Err(e) => {
+            http_response(stream, 500, &e);
+            return;
+        }
+    };
+    let edit = match security::parse_edit(body, &current) {
+        Ok(e) => e,
+        Err(e) => {
+            http_response(stream, 400, &e);
+            return;
+        }
+    };
+    if let Err(e) = security::write_to_toml(config_path, &edit) {
+        http_response(stream, 500, &format!("Could not write config: {e}"));
+        return;
+    }
+    tracing::info!(
+        "Dashboard: security settings saved (authentication {:?}, {} subscriber key(s), encryption {}) — restart to apply",
+        edit.authentication,
+        edit.subscribers.len(),
+        edit.aie.as_ref().map(|a| format!("{} SCK {} v{}", a.ksg.to_uppercase(), a.sckn, a.sck_vn)).unwrap_or_else(|| "off".into())
+    );
+    let running = match shared_config {
+        Some(cfg) => cfg.config().security.clone(),
+        None => tetra_config::bluestation::sec_security::CfgSecurity::default(),
+    };
+    http_json_response(stream, 200, &security::page_json(&running, security::load_saved(config_path)));
+}
+
+/// POST /api/security/generate {"what":"sck"|"k"} — a fresh random key for the form.
+fn serve_security_generate(stream: TcpStream, body: &str) {
+    let what = serde_json::from_str::<serde_json::Value>(body.trim())
+        .ok()
+        .and_then(|v| v.get("what").and_then(|w| w.as_str()).map(|s| s.to_string()))
+        .unwrap_or_default();
+    let n = match what.as_str() {
+        "sck" => 10,
+        "k" => 16,
+        _ => {
+            http_response(stream, 400, "what must be sck or k");
+            return;
+        }
+    };
+    match crate::net_dashboard::security::random_hex(n) {
+        Ok(h) => http_json_response(stream, 200, &format!("{{\"hex\":\"{h}\"}}")),
+        Err(e) => http_response(stream, 500, &format!("no random source: {e}")),
+    }
 }
 
 /// POST /api/telegram/verify — validate the token via getMe and return the bot @username.

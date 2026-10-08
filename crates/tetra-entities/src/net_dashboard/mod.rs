@@ -7,6 +7,7 @@ pub mod radioid;
 pub mod server;
 pub mod snom_notify;
 pub mod state;
+pub mod security;
 pub mod telegram;
 pub mod update_check;
 pub mod whitelist;

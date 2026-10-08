@@ -93,7 +93,7 @@ pub struct CfgAieDto {
     pub encrypt_groups: Option<bool>,
 }
 
-fn parse_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
+pub fn parse_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
     let hex: String = s.chars().filter(|c| !c.is_whitespace() && *c != ':').collect();
     if hex.len() != N * 2 {
         return None;

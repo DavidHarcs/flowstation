@@ -2313,6 +2313,10 @@ tbody tr:hover td{background:color-mix(in srgb,var(--bg3) 70%, transparent);}
 
     <!-- SYSTEM — configure / operate the station. -->
     <div class="nav-section-label" data-i18n-section="system_sec">SYSTEM</div>
+    <div class="nav-item" onclick="showPage('security',this)" id="nav-security">
+      <span class="nav-icon" data-icon="security"></span>
+      <span class="nav-label" data-i18n="security">SECURITY</span>
+    </div>
     <div class="nav-item" onclick="showPage('config',this)" id="nav-config">
       <span class="nav-icon" data-icon="config"></span>
       <span class="nav-label" data-i18n="config">CONFIG</span>
@@ -2342,7 +2346,7 @@ tbody tr:hover td{background:color-mix(in srgb,var(--bg3) 70%, transparent);}
       <div id="brewVerBadge" class="brew-ver-badge" style="display:none"></div>
     </div>
     <!-- Air-interface security (EN 300 392-7): cell class, cipher + key, authentication -->
-    <div class="brew-status-row" id="secRow">
+    <div class="brew-status-row" id="secRow" onclick="showPage('security')" style="cursor:pointer">
       <div class="brew-led" id="secLed"></div>
       <div class="brew-info">
         <div class="brew-info-label">SECURITY</div>
@@ -3525,6 +3529,110 @@ tbody tr:hover td{background:color-mix(in srgb,var(--bg3) 70%, transparent);}
     </div>
 
     <!-- ── CONFIG ── -->
+    <!-- ── SECURITY — authentication keys and air-interface encryption (EN 300 392-7). ── -->
+    <div class="page" id="page-security">
+      <div class="section-label" data-i18n="secp_section">Air-interface security</div>
+      <div class="card">
+        <div class="card-head">
+          <div class="card-title" data-i18n="secp_status_title">Status</div>
+          <div class="card-actions">
+            <button class="btn btn-sm" onclick="loadSecurity()"><span class="btn-icon" data-icon="restart"></span><span data-i18n="refresh">Refresh</span></button>
+            <button class="btn btn-primary" onclick="saveSecurity()"><span class="btn-icon" data-icon="save"></span><span data-i18n="save">Save</span></button>
+          </div>
+        </div>
+        <div class="card-body">
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px">
+            <div><div class="help-text" style="font-size:11px;letter-spacing:.08em;text-transform:uppercase" data-i18n="secp_running">Running now</div><div id="secp-running" style="font-family:var(--mono);font-size:13px;margin-top:4px">—</div></div>
+            <div><div class="help-text" style="font-size:11px;letter-spacing:.08em;text-transform:uppercase" data-i18n="secp_saved">Saved in config</div><div id="secp-saved" style="font-family:var(--mono);font-size:13px;margin-top:4px">—</div></div>
+          </div>
+          <div id="secp-restart" style="display:none;margin-top:12px;padding:10px 12px;border:1px solid rgba(255,178,36,0.4);background:rgba(255,178,36,0.08);border-radius:6px;font-size:13px">
+            <span data-i18n="secp_restart_needed">The saved settings differ from what is running. Restart the station to apply them.</span>
+            <button class="btn btn-sm" style="margin-left:10px" onclick="restartForSecurity()"><span class="btn-icon" data-icon="restart"></span><span data-i18n="secp_restart">Restart station</span></button>
+          </div>
+          <div id="secp-parse-error" style="display:none;margin-top:12px;color:var(--danger);font-size:13px"></div>
+          <div class="config-msg" id="secp-msg"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><div class="card-title" data-i18n="secp_auth_title">Authentication (TAA1)</div></div>
+        <div class="card-body">
+          <div class="help-text" style="margin-bottom:12px" data-i18n="secp_auth_help"></div>
+          <div class="form-row">
+            <label class="help-text" style="display:block;margin-bottom:4px" data-i18n="secp_auth_mode">Mode</label>
+            <select id="secp-auth" class="form-input" style="max-width:520px" onchange="secpDirty()">
+              <option value="off" data-i18n="secp_auth_off">Off — any radio may register</option>
+              <option value="optional" data-i18n="secp_auth_optional">Optional</option>
+              <option value="required" data-i18n="secp_auth_required">Required</option>
+            </select>
+          </div>
+          <label class="sw-row"><span class="sw-text" data-i18n="secp_mutual">Mutual authentication</span><span class="sw"><input type="checkbox" id="secp-mutual" onchange="secpDirty()"><i></i></span></label>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><div class="card-title" data-i18n="secp_keys_title">Subscriber keys</div></div>
+        <div class="card-body">
+          <div class="help-text" style="margin-bottom:12px" data-i18n="secp_keys_help"></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th data-i18n="secp_th_issi">ISSI</th><th data-i18n="secp_th_k">Key K</th><th></th></tr></thead>
+              <tbody id="secp-subs"></tbody>
+            </table>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
+            <input type="number" id="secp-sub-issi" class="form-input" placeholder="ISSI" min="1" max="16777215" style="width:140px">
+            <input type="text" id="secp-sub-k" class="form-input" placeholder="32 hex digits" autocomplete="off" spellcheck="false" style="flex:1;min-width:260px;font-family:var(--mono)">
+            <button class="btn" onclick="secpGenerate('k','secp-sub-k')"><span data-i18n="secp_generate">Generate</span></button>
+            <button class="btn btn-primary" onclick="secpAddSub()"><span class="btn-icon" data-icon="add"></span><span data-i18n="secp_add">Add</span></button>
+          </div>
+          <div id="secp-invalid" class="help-text" style="margin-top:8px;color:var(--warn);display:none"></div>
+          <div class="config-msg" id="secp-subs-msg"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><div class="card-title" data-i18n="secp_aie_title">Air-interface encryption (class 2)</div></div>
+        <div class="card-body">
+          <div class="help-text" style="margin-bottom:8px" data-i18n="secp_aie_help"></div>
+          <label class="sw-row"><span class="sw-text" data-i18n="secp_aie_enable">Enable encryption</span><span class="sw"><input type="checkbox" id="secp-aie" onchange="secpAieToggle()"><i></i></span></label>
+          <div id="secp-aie-fields" style="margin-top:12px">
+            <div class="form-row">
+              <label class="help-text" style="display:block;margin-bottom:4px" data-i18n="secp_ksg">Algorithm (KSG)</label>
+              <select id="secp-ksg" class="form-input" style="max-width:520px" onchange="secpKsgChanged()"></select>
+              <div id="secp-ksg-note" class="help-text" style="margin-top:6px"></div>
+              <div id="secp-tea1-warn" style="display:none;margin-top:8px;padding:10px 12px;border:1px solid rgba(255,77,109,0.4);background:rgba(255,77,109,0.08);border-radius:6px;font-size:13px" data-i18n="secp_tea1_warn"></div>
+            </div>
+            <div class="form-row">
+              <label class="help-text" style="display:block;margin-bottom:4px" data-i18n="secp_sck">Static cipher key (SCK)</label>
+              <div style="display:flex;gap:8px;flex-wrap:wrap">
+                <input type="text" id="secp-sck" class="form-input" placeholder="20 hex digits" autocomplete="off" spellcheck="false" style="flex:1;min-width:260px;max-width:520px;font-family:var(--mono)" oninput="secpSckDirty=true;secpDirty()">
+                <button class="btn" onclick="secpGenerate('sck','secp-sck');secpSckDirty=true;secpDirty()"><span data-i18n="secp_generate">Generate</span></button>
+              </div>
+            </div>
+            <div style="display:flex;gap:16px;flex-wrap:wrap">
+              <div class="form-row"><label class="help-text" style="display:block;margin-bottom:4px" data-i18n="secp_sckn">SCK number (1-32)</label><input type="number" id="secp-sckn" class="form-input" min="1" max="32" value="1" style="width:120px" onchange="secpDirty()"></div>
+              <div class="form-row"><label class="help-text" style="display:block;margin-bottom:4px" data-i18n="secp_sckvn">SCK version</label><input type="number" id="secp-sckvn" class="form-input" min="0" max="65535" value="1" style="width:120px" onchange="secpDirty()"></div>
+            </div>
+            <label class="sw-row"><span class="sw-text" data-i18n="secp_groups">Also encrypt group calls</span><span class="sw"><input type="checkbox" id="secp-groups" checked onchange="secpDirty()"><i></i></span></label>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><div class="card-title" data-i18n="secp_algo_title">Algorithms in this build</div></div>
+        <div class="card-body">
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th data-i18n="secp_th_algo">Algorithm</th><th data-i18n="secp_th_status">Status</th><th data-i18n="secp_th_note">Notes</th></tr></thead>
+              <tbody id="secp-algos"></tbody>
+            </table>
+          </div>
+          <div class="help-text" style="margin-top:12px" data-i18n="secp_classes"></div>
+        </div>
+      </div>
+    </div>
+
     <div class="page" id="page-config">
       <div class="section-label" data-i18n="cfg_sec_configuration">Configuration</div>
       <div class="card">
@@ -4187,6 +4295,7 @@ const ICONS = {
   rf:'<circle cx="12" cy="12" r="2"/><path d="M7.8 7.8a6 6 0 0 0 0 8.4M16.2 7.8a6 6 0 0 1 0 8.4M5 5a9 9 0 0 0 0 14M19 5a9 9 0 0 1 0 14"/>',
   health:'<path d="M3 12h3l2-5 3 10 2.5-7 1.5 2h6"/>',
   // nav — integrations / system
+  security:'<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/><circle cx="12" cy="16" r="1"/>',
   config:'<circle cx="12" cy="12" r="3"/><path d="M12 2.5v2.5M12 19v2.5M4.2 4.2l1.8 1.8M18 18l1.8 1.8M2.5 12H5M19 12h2.5M4.2 19.8 6 18M18 6l1.8-1.8"/>',
   telegram:'<path d="M20 4 3.5 11.2l6 2.1M20 4l-2.8 14-7-3.6M20 4 9.6 13.6M9.6 13.6V18l2.6-2.6"/>',
   wifi:'<path d="M4.5 9a11 11 0 0 1 15 0M7.5 12.5a6.5 6.5 0 0 1 9 0"/><circle cx="12" cy="16.5" r="1.2" fill="currentColor" stroke="none"/>',
@@ -4249,7 +4358,7 @@ const LANGS={
   en:{
     bts_ip:'BTS IP',offline:'OFFLINE',online:'ONLINE',
     brew_online:'ONLINE',brew_offline:'OFFLINE',
-    stations:'Radios',calls:'Calls',lastheard:'Last Heard',log:'Log',rf:'RF',health:'Health',asterisk:'Asterisk SIP',dapnet:'DAPNET',echolink:'EchoLink',echolink_title:'EchoLink',meshcom:'MeshCom',meshcom_title:'MeshCom',geoalarm:'GeoAlarm',geoalarm_title:'GeoAlarm',config:'Config',
+    security:'Security',stations:'Radios',calls:'Calls',lastheard:'Last Heard',log:'Log',rf:'RF',health:'Health',asterisk:'Asterisk SIP',dapnet:'DAPNET',echolink:'EchoLink',echolink_title:'EchoLink',meshcom:'MeshCom',meshcom_title:'MeshCom',geoalarm:'GeoAlarm',geoalarm_title:'GeoAlarm',config:'Config',
     sdslog:'SDS Log',th_dir:'Dir',th_from:'From',th_to:'To',th_message:'Message',no_sds:'No SDS messages yet',sds_refresh:'Refresh',
     rf_freq:'Center freq',rf_rate:'Sample rate',rf_rms:'RMS',rf_peak:'Peak',rf_age:'Snapshot',
     rf_waiting:'waiting…',rf_live:'live',rf_stale:'stale',
@@ -4313,6 +4422,20 @@ const LANGS={
     sec_cell_clear:'CLASS 1 · CLEAR',sec_auth_req:'AUTH REQ',sec_auth_opt:'AUTH OPT',sec_auth_off:'NO AUTH',
     sec_cell_hint_clear:'Security class 1: no air-interface encryption on this cell',sec_cell_hint_enc:'Security class 2: all signalling and speech on this cell are encrypted with SCK {sckn} (version {vn}) using {ksg}',
     sec_cell_hint_err:'AIE configuration rejected: {err}',sec_subs:'{n} subscriber key(s) loaded',
+    secp_section:'Air-interface security',secp_status_title:'Status',secp_running:'Running now',secp_saved:'Saved in config',
+    secp_restart_needed:'The saved settings differ from what is running. Restart the station to apply them.',secp_restart:'Restart station',
+    secp_restarting:'Restarting… the page will reconnect in a few seconds.',secp_parse_error:'config.toml does not parse — fix it on the Config page first: ',
+    secp_auth_title:'Authentication (TAA1)',secp_auth_help:'Challenge radios with their 128-bit authentication key K when they register (EN 300 392-7 clause 4). Only radios whose K is listed below can pass. Authentication is an access-control handshake and is fine on amateur allocations.',
+    secp_auth_mode:'Mode',secp_auth_off:'Off — any radio may register',secp_auth_optional:'Optional — challenge radios with a key on file, let others in',secp_auth_required:'Required — reject radios that fail or have no key',
+    secp_mutual:'Mutual authentication (answer the radio\'s challenge and challenge back)',secp_keys_title:'Subscriber keys',secp_keys_help:'One K per radio, 32 hex digits, identical to the key programmed into the radio with its KVL / programming software.',
+    secp_th_issi:'ISSI',secp_th_k:'Key K',secp_no_keys:'No subscriber keys',secp_add:'Add',secp_generate:'Generate',secp_remove:'Remove',secp_k_placeholder:'32 hex digits',secp_issi_placeholder:'ISSI',
+    secp_aie_title:'Air-interface encryption (class 2)',secp_aie_help:'Encrypt all signalling and speech on this cell with a static cipher key (SCK) shared by every radio. Radios without the key cannot register or hear traffic. Air-interface encryption is not permitted under amateur licences — enable it only on a licensed private network.',
+    secp_aie_enable:'Enable encryption',secp_ksg:'Algorithm (KSG)',secp_sck:'Static cipher key (SCK)',secp_sck_placeholder:'20 hex digits',secp_sckn:'SCK number (1-32)',secp_sckvn:'SCK version',secp_groups:'Also encrypt group calls and group signalling',
+    secp_tea1_warn:'TEA1 is broken: it keeps only 32 of its 80 key bits and the key can be recovered from a few seconds of traffic. Use it for research or to talk to TEA1-only radios, never for protection.',
+    secp_keep:'unchanged',secp_saved_ok:'Saved. Restart the station to apply.',secp_invalid_keys:'Keys on file that could not be parsed (ISSI): ',
+    secp_algo_title:'Algorithms in this build',secp_th_algo:'Algorithm',secp_th_status:'Status',secp_th_note:'Notes',secp_available:'Available',secp_unavailable:'Not available',secp_weak:'Weak — research only',
+    secp_classes:'Security classes: class 1 = clear air interface (optional authentication); class 2 = static cipher key shared by all radios (this page); class 3 = per-radio derived keys with over-the-air rekeying (not implemented).',
+    secp_unsaved:'Unsaved changes',
     th_id:'ID',th_type:'Type',th_caller:'Caller',
     th_dest:'Destination',th_speaker:'Speaker',th_duration:'Duration',
     th_time:'Time',th_activity:'Activity',
@@ -4877,6 +5000,7 @@ function showPage(name,el){
   if(name==='dapnet'){loadDapnet();loadDapnetLog();}
   if(name==='geoalarm'){loadGeoalarm();}
   if(name==='config'){loadConfig();loadWhitelist();loadWx();}
+  if(name==='security'){loadSecurity();}
   if(name==='telegram'){loadTelegram();}
   if(name==='system'){loadSystemInfo();loadConfigProfiles();loadLiveSds();loadBrightness();}
   else if(sysAutoRefreshTimer){clearInterval(sysAutoRefreshTimer);sysAutoRefreshTimer=null;const cb=document.getElementById('sys-autorefresh');if(cb)cb.checked=false;}
@@ -6893,6 +7017,106 @@ let tgTokenDirty=false;    // true once the user edits the token field (so we se
 function tgEsc(s){return (s||'').toString().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 // The token to send: a freshly-typed value (never the masked placeholder), else '' = keep saved.
 function tgTokenField(){const v=(document.getElementById('tg-token').value||'').trim();return (tgTokenDirty&&v&&!v.includes('…'))?v:'';}
+// ── Security page ─────────────────────────────────────────────────────────────
+let secpData=null,secpSubs=[],secpSckDirty=false,secpChanged=false;
+function secpEsc(s){return (s||'').toString().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function secpMsg(txt,ok,id){const el=document.getElementById(id||'secp-msg');el.textContent=txt;el.style.color=ok?'var(--accent)':'var(--danger)';if(ok)setTimeout(()=>{if(el.textContent===txt)el.textContent='';},6000);}
+function secpDirty(){secpChanged=true;const el=document.getElementById('secp-msg');el.textContent=t('secp_unsaved');el.style.color='var(--warn)';}
+function secpPosture(p){
+  if(!p)return '—';
+  const a={off:t('secp_auth_off').split(' — ')[0],optional:t('secp_auth_optional').split(' — ')[0],required:t('secp_auth_required').split(' — ')[0]}[p.authentication]||p.authentication;
+  const enc=p.aie?`${p.aie.ksg.toUpperCase()} · SCK ${p.aie.sckn} v${p.aie.sck_vn}${p.aie.weak?' ⚠':''}`:t('sec_cell_clear');
+  return `<span style="color:${p.aie?(p.aie.weak?'var(--warn)':'var(--accent)'):'var(--text2)'}">${ICON_LOCK} ${secpEsc(enc)}</span><br><span style="color:var(--text2)">AUTH ${secpEsc(a).toUpperCase()}${p.mutual_authentication&&p.authentication!=='off'?' · mutual':''} · ${(p.subscribers||[]).length} key(s)</span>`;
+}
+function secpRenderSubs(){
+  const tb=document.getElementById('secp-subs');
+  if(!secpSubs.length){tb.innerHTML=`<tr><td colspan="3" class="help-text">${t('secp_no_keys')}</td></tr>`;return;}
+  tb.innerHTML=secpSubs.map((s,i)=>`<tr><td>${idCell?idCell(s.issi):s.issi}</td><td style="font-family:var(--mono)">${s.k==='keep'?secpEsc(s.k_masked)+' <span class="badge badge-dim" style="font-size:9px">'+t('secp_keep')+'</span>':secpEsc(s.k.slice(0,4))+'…'+secpEsc(s.k.slice(-4))+' <span class="badge badge-green" style="font-size:9px">NEW</span>'}</td><td><button class="btn btn-sm btn-danger" onclick="secpRemoveSub(${i})">${t('secp_remove')}</button></td></tr>`).join('');
+}
+function secpAddSub(){
+  const issi=parseInt(document.getElementById('secp-sub-issi').value,10);
+  const k=(document.getElementById('secp-sub-k').value||'').trim().toLowerCase();
+  if(!Number.isInteger(issi)||issi<1||issi>16777215){secpMsg(t('secp_issi_placeholder')+' 1-16777215',false,'secp-subs-msg');return;}
+  if(!/^[0-9a-f]{32}$/.test(k)){secpMsg('K: '+t('secp_k_placeholder'),false,'secp-subs-msg');return;}
+  secpSubs=secpSubs.filter(s=>s.issi!==issi);secpSubs.push({issi,k});secpSubs.sort((a,b)=>a.issi-b.issi);
+  document.getElementById('secp-sub-issi').value='';document.getElementById('secp-sub-k').value='';
+  secpRenderSubs();secpDirty();
+}
+function secpRemoveSub(i){secpSubs.splice(i,1);secpRenderSubs();secpDirty();}
+async function secpGenerate(what,inputId){
+  try{const r=await fetch('/api/security/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({what})});
+    if(!r.ok){secpMsg(await r.text(),false);return;}const d=await r.json();document.getElementById(inputId).value=d.hex||'';}
+  catch{secpMsg(t('conn_error'),false);}
+}
+function secpAieToggle(){document.getElementById('secp-aie-fields').style.display=document.getElementById('secp-aie').checked?'':'none';secpDirty();}
+function secpKsgChanged(){
+  const sel=document.getElementById('secp-ksg'),id=sel.value,k=(secpData&&secpData.ksgs||[]).find(x=>x.id===id);
+  document.getElementById('secp-ksg-note').textContent=k?k.note:'';
+  document.getElementById('secp-tea1-warn').style.display=(k&&k.weak)?'':'none';
+  secpDirty();
+}
+function secpRenderAlgos(){
+  const tb=document.getElementById('secp-algos');
+  tb.innerHTML=(secpData.ksgs||[]).map(k=>`<tr><td style="font-family:var(--mono)">${k.name}</td><td>${k.available?(k.weak?`<span class="badge badge-yellow">${t('secp_weak')}</span>`:`<span class="badge badge-green">${t('secp_available')}</span>`):`<span class="badge badge-dim">${t('secp_unavailable')}</span>`}</td><td class="help-text">${secpEsc(k.note)}</td></tr>`).join('');
+}
+function secpFill(d){
+  secpData=d;
+  document.getElementById('secp-running').innerHTML=secpPosture(d.running);
+  document.getElementById('secp-saved').innerHTML=d.saved?secpPosture(d.saved):'—';
+  document.getElementById('secp-restart').style.display=d.restart_required?'':'none';
+  const pe=document.getElementById('secp-parse-error');
+  if(d.parse_error){pe.style.display='';pe.textContent=t('secp_parse_error')+d.parse_error;}else{pe.style.display='none';}
+  const s=d.saved||d.running;
+  document.getElementById('secp-auth').value=s.authentication||'off';
+  document.getElementById('secp-mutual').checked=!!s.mutual_authentication;
+  secpSubs=(s.subscribers||[]).map(x=>({issi:x.issi,k:'keep',k_masked:x.k_masked}));
+  secpRenderSubs();
+  const inv=document.getElementById('secp-invalid');
+  if((s.invalid_subscriber_keys||[]).length){inv.style.display='';inv.textContent=t('secp_invalid_keys')+s.invalid_subscriber_keys.join(', ');}else{inv.style.display='none';}
+  const sel=document.getElementById('secp-ksg');
+  sel.innerHTML=(d.ksgs||[]).map(k=>`<option value="${k.id}"${k.available?'':' disabled'}>${k.name}${k.weak?' — research only':''}${k.available?'':' — not available'}</option>`).join('');
+  const aie=s.aie;
+  document.getElementById('secp-aie').checked=!!aie;
+  document.getElementById('secp-aie-fields').style.display=aie?'':'none';
+  sel.value=aie?aie.ksg:'tea3';
+  document.getElementById('secp-sck').value=aie?aie.sck_masked:'';secpSckDirty=false;
+  document.getElementById('secp-sckn').value=aie?aie.sckn:1;
+  document.getElementById('secp-sckvn').value=aie?aie.sck_vn:1;
+  document.getElementById('secp-groups').checked=aie?!!aie.encrypt_groups:true;
+  const k=(d.ksgs||[]).find(x=>x.id===sel.value);
+  document.getElementById('secp-ksg-note').textContent=k?k.note:'';
+  document.getElementById('secp-tea1-warn').style.display=(k&&k.weak)?'':'none';
+  secpRenderAlgos();
+  if(s.aie_error){secpMsg(s.aie_error,false);}else if(!secpChanged){document.getElementById('secp-msg').textContent='';}
+  secpChanged=false;
+}
+async function loadSecurity(){
+  try{const r=await fetch('/api/security');if(!r.ok){secpMsg(t('conn_error'),false);return;}secpFill(await r.json());}
+  catch{secpMsg(t('conn_error'),false);}
+}
+async function saveSecurity(){
+  const enabled=document.getElementById('secp-aie').checked;
+  const sck=(document.getElementById('secp-sck').value||'').trim().toLowerCase();
+  if(enabled&&secpSckDirty&&!/^[0-9a-f]{20}$/.test(sck)){secpMsg('SCK: '+t('secp_sck_placeholder'),false);return;}
+  const body={
+    authentication:document.getElementById('secp-auth').value,
+    mutual_authentication:document.getElementById('secp-mutual').checked,
+    subscribers:secpSubs.map(s=>({issi:s.issi,k:s.k})),
+    aie:enabled?{enabled:true,ksg:document.getElementById('secp-ksg').value,sck:secpSckDirty?sck:'keep',
+      sckn:parseInt(document.getElementById('secp-sckn').value,10)||1,sck_vn:parseInt(document.getElementById('secp-sckvn').value,10)||0,
+      encrypt_groups:document.getElementById('secp-groups').checked}:{enabled:false}
+  };
+  try{
+    const r=await fetch('/api/security',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(!r.ok){secpMsg(await r.text(),false);return;}
+    secpChanged=false;secpFill(await r.json());secpMsg(t('secp_saved_ok'),true);
+  }catch{secpMsg(t('conn_error'),false);}
+}
+async function restartForSecurity(){
+  try{await fetch('/api/security/restart',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});secpMsg(t('secp_restarting'),true);}
+  catch{secpMsg(t('conn_error'),false);}
+}
+
 async function loadTelegram(){
   try{
     const r=await fetch('/api/telegram');
