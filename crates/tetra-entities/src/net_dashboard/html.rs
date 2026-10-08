@@ -2341,6 +2341,15 @@ tbody tr:hover td{background:color-mix(in srgb,var(--bg3) 70%, transparent);}
       </div>
       <div id="brewVerBadge" class="brew-ver-badge" style="display:none"></div>
     </div>
+    <!-- Air-interface security (EN 300 392-7): cell class, cipher + key, authentication -->
+    <div class="brew-status-row" id="secRow">
+      <div class="brew-led" id="secLed"></div>
+      <div class="brew-info">
+        <div class="brew-info-label">SECURITY</div>
+        <div class="brew-info-val" id="secText">CLASS 1 · CLEAR</div>
+      </div>
+      <div id="secAuthBadge" class="brew-ver-badge" style="display:none"></div>
+    </div>
     <!-- Copyright + client info -->
     <div class="sidebar-copyright">
       <div class="cr-line">© 2026 Razvan Zeces — YO6RZV</div>
@@ -2677,6 +2686,7 @@ tbody tr:hover td{background:color-mix(in srgb,var(--bg3) 70%, transparent);}
                 <th data-i18n="th_groups">Groups</th>
                 <th class="col-mobile-hide" data-i18n="th_ee">Energy Economy</th>
                 <th data-i18n="th_signal">Signal</th>
+                <th data-i18n="th_security">Security</th>
                 <th data-i18n="th_status">Status</th>
                 <th class="col-mobile-hide" data-i18n="th_last_seen">Last seen</th>
                 <th data-i18n="th_actions">Actions</th>
@@ -4223,6 +4233,7 @@ function svgIcon(name, size){
 }
 // Filled selection marker (▶ in selected-TG rows) — own fill, no stroke.
 const ICON_MARKER = '<svg viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><path d="M8 5l11 7-11 7Z"/></svg>';
+const ICON_LOCK = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="width:10px;height:10px;vertical-align:-1px"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>';
 // Paint every declarative icon slot ([data-icon="name"]) from the ICONS map.
 // Keeps the nav/header markup DRY; the Tabs phase can drop more [data-icon] slots.
 function paintIcons(root){
@@ -4296,6 +4307,12 @@ const LANGS={
     tg_selected:'Selected talkgroup (last keyed up)',
     tg_affiliated_short:'affiliated',tg_affiliated_hint:'Other talkgroups this radio is affiliated to (kept attached on the BS even when scan is off on the device)',
     th_status:'Status',th_last_seen:'Last seen',th_actions:'Actions',
+    th_security:'Security',sec_auth:'AUTH',sec_auth_hint:'Radio proved its authentication key K (TAA1 challenge)',
+    sec_clear:'CLEAR',sec_clear_hint:'No encrypted PDU seen from this radio: its signalling and speech are in clear',
+    sec_enc_hint:'Radio is encrypting with the cell\'s static cipher key',sec_weak_hint:'TEA1 keeps only 32 of its 80 key bits (TETRA:BURST) — research use only',
+    sec_cell_clear:'CLASS 1 · CLEAR',sec_auth_req:'AUTH REQ',sec_auth_opt:'AUTH OPT',sec_auth_off:'NO AUTH',
+    sec_cell_hint_clear:'Security class 1: no air-interface encryption on this cell',sec_cell_hint_enc:'Security class 2: all signalling and speech on this cell are encrypted with SCK {sckn} (version {vn}) using {ksg}',
+    sec_cell_hint_err:'AIE configuration rejected: {err}',sec_subs:'{n} subscriber key(s) loaded',
     th_id:'ID',th_type:'Type',th_caller:'Caller',
     th_dest:'Destination',th_speaker:'Speaker',th_duration:'Duration',
     th_time:'Time',th_activity:'Activity',
@@ -5191,7 +5208,7 @@ async function wifiCall(url, body){
 function escAttr(s){ return String(s).replace(/&/g,'&amp;').replace(/'/g,"&#39;").replace(/"/g,'&quot;'); }
 
 // ── State + WS ────────────────────────────────────────────────────────────
-let ws=null,state={ms:{},calls:{},emergencies:{},lastHeard:[],sdsLog:[],dapnetLog:[],geoalarmEvents:[],brewOnline:false,brewVer:0,dgnaDefaultAttachmentMode:0,dgnaAttachmentModePickerEnabled:false},sdsDest=0;
+let ws=null,state={ms:{},calls:{},emergencies:{},secByIssi:{},cellSec:null,lastHeard:[],sdsLog:[],dapnetLog:[],geoalarmEvents:[],brewOnline:false,brewVer:0,dgnaDefaultAttachmentMode:0,dgnaAttachmentModePickerEnabled:false},sdsDest=0;
 let dgnaUi={selectedGssi:0,targetChecks:{},statusLog:[],lastByIssi:{}};
 
 // ── RadioID callsigns (indicativ) ──────────────────────────────────────────────
@@ -5278,6 +5295,46 @@ function syncTopbarChips(){
   if(emg)emg.style.display=Object.keys(state.emergencies||{}).length?'inline-flex':'none';
 }
 
+function setCellSecurity(cs){
+  state.cellSec=cs||null;
+  const row=document.getElementById('secRow'),led=document.getElementById('secLed'),txt=document.getElementById('secText'),ab=document.getElementById('secAuthBadge');
+  if(!row)return;
+  let hint='';
+  if(cs&&cs.class===2){
+    led.classList.add('on');
+    txt.textContent=`${cs.ksg} · SCK ${cs.sckn} v${cs.sck_vn}`;
+    txt.style.color=cs.weak?'var(--warn)':'var(--accent)';
+    led.style.background=cs.weak?'var(--warn)':'var(--accent)';led.style.boxShadow=cs.weak?'0 0 6px rgba(255,178,36,0.6)':'0 0 6px rgba(0,212,168,0.6)';
+    hint=t('sec_cell_hint_enc',{sckn:cs.sckn,vn:cs.sck_vn,ksg:cs.ksg})+(cs.weak?'. '+t('sec_weak_hint'):'');
+  } else {
+    led.classList.remove('on');led.style.background='';led.style.boxShadow='';
+    txt.textContent=t('sec_cell_clear');txt.style.color='';
+    hint=t('sec_cell_hint_clear');
+    if(cs&&cs.aie_error)hint+='. '+t('sec_cell_hint_err',{err:cs.aie_error});
+  }
+  const auth=cs?cs.authentication:'off';
+  if(auth==='required'||auth==='optional'){
+    ab.textContent=t(auth==='required'?'sec_auth_req':'sec_auth_opt');ab.style.display='inline-block';
+    const ok=auth==='required';
+    ab.style.background=ok?'rgba(0,212,168,0.15)':'rgba(255,178,36,0.15)';ab.style.color=ok?'var(--accent)':'var(--warn)';ab.style.border=ok?'1px solid rgba(0,212,168,0.4)':'1px solid rgba(255,178,36,0.4)';
+    hint+='. '+t('sec_subs',{n:cs.subscribers||0})+(cs.mutual?', mutual':'');
+  } else {ab.style.display='none';}
+  row.title=hint;
+  renderStations();
+}
+// Per-radio security cell: what key the radio is using on this cell (or CLEAR), and whether it
+// authenticated. The cipher/SCK shown is the cell's — a class 2 cell has one static cipher key.
+function secCell(m){
+  const cs=state.cellSec,out=[];
+  if(m.authenticated)out.push(`<span class="badge badge-blue" style="font-size:9px" title="${t('sec_auth_hint')}">${ICON_LOCK} ${t('sec_auth')}</span>`);
+  if(m.encrypting&&cs&&cs.class===2){
+    out.push(`<span class="badge ${cs.weak?'badge-yellow':'badge-green'}" style="font-size:9px" title="${cs.weak?t('sec_weak_hint'):t('sec_enc_hint')}">${ICON_LOCK} ${cs.ksg} SCK${cs.sckn} v${cs.sck_vn}</span>`);
+  } else {
+    out.push(`<span class="badge badge-dim" style="font-size:9px" title="${t('sec_clear_hint')}">${t('sec_clear')}</span>`);
+  }
+  return out.join(' ');
+}
+
 function setBrewStatus(online,version){
   state.brewOnline=online;state.brewVer=version||0;
   const led=document.getElementById('brewLed');
@@ -5354,6 +5411,8 @@ function handleMsg(msg){
       });
       if(msg.log&&msg.log.length){document.getElementById('log-container').innerHTML='';msg.log.forEach(e=>appendLog(e));}
       setBrewStatus(!!msg.brew_online,msg.brew_version||0);
+      state.secByIssi={};(msg.ms||[]).forEach(m=>{state.secByIssi[m.issi]={authenticated:!!m.authenticated,encrypting:!!m.encrypting};});
+      setCellSecurity(msg.cell_security||null);
       if(msg.fallback_config_active){showFallbackBanner(msg.fallback_config_reason||'');}
       // If the server already has recent RF snapshots, paint them instantly
       // so the RF page has data before the next emit cycle.
@@ -5373,10 +5432,18 @@ function handleMsg(msg){
       // registered entries must have a defined-but-null selected_group so the equality
       // comparison `g === sel` in renderStations behaves consistently with the server-side
       // None initialiser in server.rs.
-      state.ms[msg.issi]=Object.assign({issi:msg.issi,groups:[],group_catalog:[],selected_group:null,rssi_dbfs:null,energy_saving_mode:0},state.ms[msg.issi]||{},{issi:msg.issi,_last_seen_ts:Date.now()});
+      state.ms[msg.issi]=Object.assign({issi:msg.issi,groups:[],group_catalog:[],selected_group:null,rssi_dbfs:null,energy_saving_mode:0,authenticated:false,encrypting:false},state.ms[msg.issi]||{},state.secByIssi[msg.issi]||{},{issi:msg.issi,_last_seen_ts:Date.now()});
       renderStations();renderDgnaPage();break;
     case 'ms_deregistered':
-      delete state.ms[msg.issi];renderStations();renderDgnaPage();break;
+      delete state.ms[msg.issi];delete state.secByIssi[msg.issi];renderStations();renderDgnaPage();break;
+    case 'ms_security':{
+      // Authentication completes before the registration that creates the MS row, so the
+      // flags are kept per ISSI and merged into the row when it appears.
+      const f=state.secByIssi[msg.issi]||(state.secByIssi[msg.issi]={authenticated:false,encrypting:false});
+      if(msg.authenticated!=null)f.authenticated=!!msg.authenticated;
+      if(msg.encrypting!=null)f.encrypting=!!msg.encrypting;
+      if(state.ms[msg.issi])Object.assign(state.ms[msg.issi],f);
+      renderStations();break;}
     case 'ms_rssi':
       if(state.ms[msg.issi]){state.ms[msg.issi].rssi_dbfs=msg.rssi_dbfs;state.ms[msg.issi]._last_seen_ts=Date.now();}
       renderStations();renderDgnaPage();break;
@@ -5989,7 +6056,7 @@ function renderStations(){
   if(hs)hs.textContent=msCount?t('registered'):t('no_terminals');
   if(hc)hc.textContent=callCount;
   const tb=document.getElementById('ms-tbody');
-  if(!ms.length){tb.innerHTML=`<tr><td colspan="7"><div class="empty-state"><span class="empty-ico">${svgIcon('radios')}</span><div class="empty-msg">${t('no_terminals')}</div></div></td></tr>`;return;}
+  if(!ms.length){tb.innerHTML=`<tr><td colspan="8"><div class="empty-state"><span class="empty-ico">${svgIcon('radios')}</span><div class="empty-msg">${t('no_terminals')}</div></div></td></tr>`;return;}
   tb.innerHTML=ms.sort((a,b)=>a.issi-b.issi).map(m=>{
     const r=m.rssi_dbfs,rL=r!=null?`${r.toFixed(1)} dBFS`:'—',pct=rssiPct(r),gcls=rssiGaugeClass(r);
     let grps;
@@ -6025,6 +6092,7 @@ function renderStations(){
       <td>${emg?'<span class="badge badge-emergency">'+t('call_emergency')+'</span> ':''}${idCell(m.issi)}</td><td>${grps}</td>
       <td class="col-mobile-hide">${eeLabel(m.energy_saving_mode||0)}</td>
       <td><div class="gauge ${gcls}"><div class="gauge-track"><div class="gauge-fill" style="width:${pct}%"></div></div><span class="gauge-value">${rL}</span></div></td>
+      <td>${secCell(m)}</td>
       <td><span class="pill pill-ok">${t('online_badge')}</span></td>
       <td class="col-mobile-hide">${lastSeenLabel(ls)}</td>
       <td><button class="btn btn-sm" onclick="openSds(${m.issi})">${t('sds')}</button> <button class="btn btn-sm" onclick="openDgna(${m.issi})" title="${t('dgna_title')}">${t('dgna')}</button> <button class="btn btn-sm btn-danger" onclick="kickMs(${m.issi})">${t('kick')}</button>${emg?` <button class="btn btn-sm btn-danger" onclick="clearEmergency(${m.issi})">${t('emg_clear')}</button>`:''}</td>

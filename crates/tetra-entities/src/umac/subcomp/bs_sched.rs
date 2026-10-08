@@ -1,3 +1,7 @@
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use crate::umac::subcomp::aie::AieCell;
 use tetra_core::{
     BitBuffer, Direction, LinkId, PhyBlockNum, PhysicalChannel, SsiType, TdmaTime, TetraAddress, Todo, TxReporter, unimplemented_log,
 };
@@ -130,6 +134,12 @@ pub struct BsChannelScheduler {
     /// the next frame to avoid exceeding the 216-bit slot capacity (DConnect+DConnectAck=223 bits).
     mcch_chan_alloc_sent_this_frame: bool,
 
+    /// Air-interface encryption of this cell (class 2), `None` for a clear cell.
+    aie: Option<Arc<AieCell>>,
+    /// Radios that have sent us encrypted uplink PDUs, i.e. that hold the SCK: downlink
+    /// PDUs addressed to them are encrypted. Others keep receiving in clear.
+    encrypting_issis: HashSet<u32>,
+
     /// Per-timeslot rotating cursor for allocating usage markers to multi-slot
     /// uplink reservations. Wraps in the valid range [4, 62] (0 = unallocated,
     /// 1-3 reserved, 63 = common linearisation; per ETSI TS 100 392-2 §23.5.1).
@@ -166,7 +176,9 @@ pub enum DlSchedElem {
     /// Pre-built STCH block for FACCH/stealing a half-slot from traffic channel.
     /// Contains MAC-U-SIGNAL (3 bits) + TM-SDU = 124 type1 bits.
     /// Delivers time-critical signaling (D-TX CEASED, D-TX GRANTED) per EN 300 392-2, clause 23.5.
-    Stealing(BitBuffer, Option<TxReporter>),
+    /// The optional (header bits, SDU bits) layout marks a block whose header is already
+    /// encrypted-addressed; its SDU is encrypted when the transmit slot is known.
+    Stealing(BitBuffer, Option<TxReporter>, Option<(usize, usize)>),
 }
 
 const EMPTY_SCHED_ELEM: TimeslotSchedule = TimeslotSchedule {
@@ -194,6 +206,8 @@ impl BsChannelScheduler {
             hangtime: [false, false, false, false],
             pending_ra_acks: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             mcch_chan_alloc_sent_this_frame: false,
+            aie: None,
+            encrypting_issis: HashSet::new(),
             // Start each timeslot's marker cursor at 4 (first valid value).
             next_usage_marker: [4, 4, 4, 4],
         }
@@ -723,6 +737,43 @@ impl BsChannelScheduler {
         [link_ts, 0, 0, 0]
     }
 
+    /// Switch air-interface encryption on (or off with `None`) for this carrier.
+    pub fn set_aie(&mut self, aie: Option<Arc<AieCell>>) {
+        self.aie = aie;
+    }
+
+    /// Note that a radio uses encryption on the uplink, so downlink PDUs to it are encrypted.
+    /// Returns `true` the first time this ISSI is marked.
+    pub fn mark_encrypting(&mut self, issi: u32) -> bool {
+        self.encrypting_issis.insert(issi)
+    }
+
+    /// Mark a MAC-RESOURCE for encryption when the cell encrypts and the addressee can
+    /// decrypt: its header gets the encryption mode element and the ESI in place of the
+    /// SSI (EN 300 392-7 clauses 4.2.6 and 6.5.1.2). The TM-SDU bits are encrypted later,
+    /// per chunk, when the transmit slot is known.
+    fn protect_resource(&self, mut pdu: MacResource) -> MacResource {
+        let Some(aie) = &self.aie else {
+            return pdu;
+        };
+        let Some(addr) = pdu.addr else {
+            return pdu;
+        };
+        if pdu.is_null_pdu() || pdu.encryption_mode != 0 {
+            return pdu;
+        }
+        let encrypt = match addr.ssi_type {
+            SsiType::Issi => self.encrypting_issis.contains(&addr.ssi),
+            SsiType::Gssi => aie.encrypt_groups,
+            _ => false,
+        };
+        if encrypt {
+            pdu.encryption_mode = aie.encryption_mode();
+            pdu.addr = Some(aie.esi(addr));
+        }
+        pdu
+    }
+
     fn dl_enqueue_tma_on_timeslots(
         &mut self,
         timeslots: [u8; NUM_TIMESLOTS],
@@ -730,6 +781,7 @@ impl BsChannelScheduler {
         sdu: BitBuffer,
         tx_reporter: Option<TxReporter>,
     ) {
+        let pdu = self.protect_resource(pdu);
         // Queue the message for all timeslots on which we should transmit this message.
         // The loop basically prevents cloning the last element.
         for i in 0..NUM_TIMESLOTS {
@@ -815,8 +867,27 @@ impl BsChannelScheduler {
     /// Enqueue a pre-built STCH block for FACCH/stealing on a traffic timeslot.
     /// The block must be 124 type1 bits containing MAC-U-SIGNAL header + TM-SDU.
     pub fn dl_enqueue_stealing(&mut self, ts: u8, block: BitBuffer, tx_reporter: Option<TxReporter>) {
-        tracing::info!("dl_enqueue_stealing: ts {} enqueueing STCH block ({} bits)", ts, block.get_len());
-        self.dltx_queues[ts as usize - 1].push(DlSchedElem::Stealing(block, tx_reporter));
+        self.dl_enqueue_stealing_layout(ts, block, tx_reporter, None);
+    }
+
+    /// As [`BsChannelScheduler::dl_enqueue_stealing`], for a block whose MAC-RESOURCE header
+    /// carries the encryption mode: `layout` = (header bits, TM-SDU bits) so the SDU can be
+    /// encrypted with the key stream of the slot it is finally sent in.
+    pub fn dl_enqueue_stealing_layout(&mut self, ts: u8, block: BitBuffer, tx_reporter: Option<TxReporter>, layout: Option<(usize, usize)>) {
+        tracing::info!("dl_enqueue_stealing: ts {} enqueueing STCH block ({} bits{})", ts, block.get_len(), if layout.is_some() { ", encrypted" } else { "" });
+        self.dltx_queues[ts as usize - 1].push(DlSchedElem::Stealing(block, tx_reporter, layout));
+    }
+
+    /// Whether traffic on this cell is encrypted: in a class 2 cell the SCK protects all
+    /// speech (EN 300 392-7 clause 6.5.0); radios without the key cannot take part.
+    pub fn traffic_encrypted(&self) -> bool {
+        self.aie.is_some()
+    }
+
+    /// Prepare a MAC-RESOURCE header for an encrypted addressee (ESI + encryption mode), see
+    /// `protect_resource`; exposed for blocks built outside the scheduler (STCH stealing).
+    pub fn protect_resource_header(&self, pdu: MacResource) -> MacResource {
+        self.protect_resource(pdu)
     }
 
     fn dl_enqueue_tma_frag_next_frame(&mut self, fragger: BsFragger) {
@@ -1133,8 +1204,12 @@ impl BsChannelScheduler {
                             // Allocate bitbuf if not already done
                             let mut buf = buf_opt.unwrap_or_else(|| BitBuffer::new(SCH_F_CAP));
                             // Create fragger, either to send the whole PDU or to start fragmentation
+                            let encrypted = pdu.encryption_mode != 0;
                             let mut fragger = BsFragger::new(pdu, sdu, tx_reporter);
-                            if !fragger.get_next_chunk(&mut buf) {
+                            if encrypted {
+                                fragger.set_cipher(self.aie.clone());
+                            }
+                            if !fragger.get_next_chunk_at(&mut buf, ts, PhyBlockNum::Both) {
                                 // Fragmentation was started and we have more chunks to send
                                 // Enqueue fragger with remaining data for retrieval next frame
                                 self.dl_enqueue_tma_frag_next_frame(fragger);
@@ -1145,7 +1220,7 @@ impl BsChannelScheduler {
                         DlSchedElem::FragBuf(mut fragger) => {
                             // Allocate bitbuf if not already done
                             let mut buf = buf_opt.unwrap_or_else(|| BitBuffer::new(SCH_F_CAP));
-                            if !fragger.get_next_chunk(&mut buf) {
+                            if !fragger.get_next_chunk_at(&mut buf, ts, PhyBlockNum::Both) {
                                 // Fragmentation was continued and we still have more chunks to send
                                 // Re-enqueue fragger with remaining data for retrieval next frame
                                 self.dl_enqueue_tma_frag_next_frame(fragger);
@@ -1153,7 +1228,7 @@ impl BsChannelScheduler {
                             buf_opt = Some(buf);
                         }
 
-                        DlSchedElem::Stealing(_, tx_reporter) => {
+                        DlSchedElem::Stealing(_, tx_reporter, _) => {
                             // Stealing items should only appear on traffic timeslots; discard if found here
                             tracing::warn!(
                                 "dl_build_block_from_signalling_schedule: Stealing item found on non-traffic ts {}, discarding",
@@ -1228,7 +1303,17 @@ impl BsChannelScheduler {
             let q = &mut self.dltx_queues[ts.t as usize - 1];
             if let Some(i) = q.iter().position(|e| matches!(e, DlSchedElem::Stealing(..))) {
                 match q.remove(i) {
-                    DlSchedElem::Stealing(buf, tx_reporter) => (Some(buf), tx_reporter),
+                    DlSchedElem::Stealing(mut buf, tx_reporter, layout) => {
+                        // Encrypt the stolen block's TM-SDU now that the slot is known: STCH is the
+                        // first half slot, key stream from KSS(0).
+                        if let (Some((hdr, sdu_bits)), Some(aie)) = (layout, &self.aie) {
+                            let pos = buf.get_pos();
+                            buf.seek(hdr);
+                            aie.apply(&mut buf, sdu_bits, ts, false, PhyBlockNum::Block1);
+                            buf.seek(pos);
+                        }
+                        (Some(buf), tx_reporter)
+                    }
                     _ => unreachable!(),
                 }
             } else {
@@ -1244,6 +1329,22 @@ impl BsChannelScheduler {
         // If desired, report transmission
         if let Some(tx_reporter) = tx_reporter_opt {
             tx_reporter.mark_transmitted();
+        }
+
+        // Air-interface encryption of the speech frame (EN 300 392-7 Table 6.4): a full
+        // TCH/S slot takes KSS(0 … 273); when the first half slot is stolen only the second
+        // half of the frame (bits 137 … 273) goes out, under KSS(216 … 352).
+        let mut tch_buf = tch_buf;
+        if let Some(aie) = &self.aie {
+            let pos = tch_buf.get_pos();
+            if stch_opt.is_some() {
+                tch_buf.seek(TCH_S_CAP / 2);
+                aie.apply(&mut tch_buf, TCH_S_CAP - TCH_S_CAP / 2, ts, false, PhyBlockNum::Block2);
+            } else {
+                tch_buf.seek(0);
+                aie.apply(&mut tch_buf, TCH_S_CAP, ts, false, PhyBlockNum::Both);
+            }
+            tch_buf.seek(pos);
         }
 
         (tch_buf, stch_opt)

@@ -225,6 +225,11 @@ pub enum TelemetryEvent {
         priority: Option<u8>,
         paths: Vec<String>,
     },
+    /// A radio's air-interface security state changed. `authenticated` is set once the radio
+    /// passed a TAA1 challenge (EN 300 392-7 clause 4.4); `encrypting` once the MAC first
+    /// decrypted a PDU it sent under the cell's static cipher key. `None` leaves that flag as it
+    /// was. Appended last for bitcode wire-stability.
+    MsSecurity { issi: u32, authenticated: Option<bool>, encrypting: Option<bool> },
 }
 
 /// A single host-system sensor reading. Kept flat for easy JSON serialisation

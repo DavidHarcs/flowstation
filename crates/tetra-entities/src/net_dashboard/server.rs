@@ -1018,14 +1018,31 @@ impl DashboardServer {
                     );
                     s.push_log("INFO", format!("MS {} registered", issi));
                 }
+                TelemetryEvent::MsSecurity { issi, authenticated, encrypting } => {
+                    let flags = s.ms_security.entry(*issi).or_default();
+                    if let Some(a) = authenticated {
+                        flags.0 = *a;
+                    }
+                    if let Some(e) = encrypting {
+                        flags.1 = *e;
+                    }
+                    if *authenticated == Some(true) {
+                        s.push_log("INFO", format!("MS {} authenticated", issi));
+                    }
+                    if *encrypting == Some(true) {
+                        s.push_log("INFO", format!("MS {} is encrypting (SCK)", issi));
+                    }
+                }
                 TelemetryEvent::MsDeregistration { issi } => {
                     s.ms_map.remove(issi);
+                    s.ms_security.remove(issi);
                     s.push_log("INFO", format!("MS {} deregistered", issi));
                 }
                 TelemetryEvent::MsTimeoutDrop { issi } => {
                     // Same UI effect as a deregistration (the MS is gone from the cell); the
                     // distinct event only matters to alert consumers that report the reason.
                     s.ms_map.remove(issi);
+                    s.ms_security.remove(issi);
                     s.push_log("WARN", format!("MS {} dropped (no response to T351)", issi));
                 }
                 TelemetryEvent::MsGroupAttach { issi, gssis } => {
@@ -1437,6 +1454,31 @@ impl DashboardServer {
     }
 }
 
+
+/// The cell's security posture for the dashboard: class 1 (clear) or class 2 with the SCK in
+/// use, and the authentication mode (EN 300 392-7 clauses 4.4 and 6.5).
+fn cell_security_json(sec: &tetra_config::bluestation::sec_security::CfgSecurity) -> serde_json::Value {
+    use tetra_config::bluestation::sec_security::AuthenticationMode;
+    let authentication = match sec.authentication {
+        AuthenticationMode::Off => "off",
+        AuthenticationMode::Optional => "optional",
+        AuthenticationMode::Required => "required",
+    };
+    match &sec.aie {
+        Some(a) => serde_json::json!({
+            "class": 2, "ksg": a.ksg.to_uppercase(), "sckn": a.sckn, "sck_vn": a.sck_vn,
+            "weak": a.ksg == "tea1", "encrypt_groups": a.encrypt_groups,
+            "authentication": authentication, "mutual": sec.mutual_authentication,
+            "subscribers": sec.subscribers.len(),
+        }),
+        None => serde_json::json!({
+            "class": 1, "aie_error": sec.aie_error,
+            "authentication": authentication, "mutual": sec.mutual_authentication,
+            "subscribers": sec.subscribers.len(),
+        }),
+    }
+}
+
 fn event_to_ws_msg(event: &TelemetryEvent) -> Option<String> {
     let v = match event {
         TelemetryEvent::MsRegistration { issi } => serde_json::json!({"type":"ms_registered","issi":issi}),
@@ -1459,6 +1501,9 @@ fn event_to_ws_msg(event: &TelemetryEvent) -> Option<String> {
         }),
         TelemetryEvent::MsRssi { issi, rssi_dbfs } => serde_json::json!({"type":"ms_rssi","issi":issi,"rssi_dbfs":rssi_dbfs}),
         TelemetryEvent::MsEnergySaving { issi, mode } => serde_json::json!({"type":"ms_energy_saving","issi":issi,"mode":mode}),
+        TelemetryEvent::MsSecurity { issi, authenticated, encrypting } => {
+            serde_json::json!({"type":"ms_security","issi":issi,"authenticated":authenticated,"encrypting":encrypting})
+        }
         TelemetryEvent::GroupCallStarted {
             call_id,
             gssi,
@@ -2658,8 +2703,10 @@ fn handle_ws(
                 )
             })
             .unwrap_or((0, false));
+        let cell_security = shared_config.as_ref().map(|cfg| cell_security_json(&cfg.config().security));
         if let Ok(json) = serde_json::to_string(&serde_json::json!({
             "type": "snapshot", "ms": ms, "calls": calls, "emergencies": emergencies, "log": logs,
+            "cell_security": cell_security,
             "brew_online": brew_online, "brew_version": brew_version, "last_heard": last_heard,
             "fallback_config_active": fallback_active, "fallback_config_reason": fallback_reason,
             "last_tx_visual": last_tx_visual,
@@ -6002,6 +6049,27 @@ dest_issi = 2632585
             "Open — all ISSI may register"
         );
         assert_eq!(normalize_mojibake_html("waitingÃ¢â‚¬Â¦"), "waiting…");
+    }
+
+    /// Authentication completes before the registration that creates the MS row, and the
+    /// encrypting flag arrives from the MAC later: both must end up on the radio's row, and
+    /// a deregistration must forget them.
+    #[test]
+    fn security_flags_survive_registration_order() {
+        let server = DashboardServer::new("/tmp/fs_sec_flags_test_config.toml".to_string());
+        let snap = |issi: u32| {
+            server.state.read().unwrap().snapshot_ms().into_iter().find(|m| m.issi == issi).map(|m| (m.authenticated, m.encrypting))
+        };
+
+        server.handle_telemetry(TelemetryEvent::MsSecurity { issi: 2358245, authenticated: Some(true), encrypting: None });
+        assert_eq!(snap(2358245), None, "no row before registration");
+        server.handle_telemetry(TelemetryEvent::MsRegistration { issi: 2358245 });
+        assert_eq!(snap(2358245), Some((true, false)));
+        server.handle_telemetry(TelemetryEvent::MsSecurity { issi: 2358245, authenticated: None, encrypting: Some(true) });
+        assert_eq!(snap(2358245), Some((true, true)));
+        server.handle_telemetry(TelemetryEvent::MsDeregistration { issi: 2358245 });
+        server.handle_telemetry(TelemetryEvent::MsRegistration { issi: 2358245 });
+        assert_eq!(snap(2358245), Some((false, false)), "flags are per registration");
     }
 
     /// FH-BUG (brew shown as v0): the transport reports version 0 ("unknown") on every (re)connect

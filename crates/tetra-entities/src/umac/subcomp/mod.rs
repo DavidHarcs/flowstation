@@ -1,3 +1,4 @@
+pub mod aie;
 pub mod bs_defrag;
 pub mod bs_frag;
 pub mod bs_sched;

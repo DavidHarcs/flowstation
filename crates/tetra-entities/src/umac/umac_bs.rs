@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::freqs::FreqInfo;
@@ -33,6 +34,7 @@ use tetra_saps::{SapMsg, SapMsgInner};
 
 use crate::lmac::components::scrambler;
 use crate::net_telemetry::{TelemetryEvent, channel::TelemetrySink};
+use crate::umac::subcomp::aie::AieCell;
 use crate::umac::subcomp::bs_frag::BsFragger;
 use crate::umac::subcomp::bs_sched::{BsChannelScheduler, CarrierDownlinkMode, PrecomputedUmacPdus, TCH_S_CAP};
 use crate::umac::subcomp::fillbits;
@@ -63,6 +65,11 @@ pub struct UmacBs {
     /// Timestamp of last received UL voice frame per carrier/timeslot.
     /// Used to detect UL inactivity when a radio disappears mid-transmission.
     last_ul_voice: HashMap<(u16, u8), TdmaTime>,
+    /// Air-interface encryption of this cell (class 2), `None` for a clear cell.
+    aie: Option<Arc<AieCell>>,
+    /// Uplink fragmented PDUs in progress that are encrypted, per carrier/timeslot, so the
+    /// MAC-FRAG / MAC-END chunks that follow (which carry no encryption flag) are decrypted.
+    ul_encrypted: HashMap<(u16, u8), bool>,
     /// Local floor owner per traffic carrier/timeslot, used to attribute MAC-U-SIGNAL
     /// uplink signalling that does not carry an address field.
     ul_signal_owner: HashMap<(u16, u8), u32>,
@@ -88,6 +95,16 @@ struct PendingStch {
 
 impl UmacBs {
     pub fn new(config: SharedConfig, telemetry: Option<TelemetrySink>) -> Self {
+        // Air-interface encryption (class 2) for every carrier of this cell.
+        let aie = AieCell::from_config(&config.config());
+        {
+            let posture = config.config().security.aie_posture();
+            if aie.is_some() {
+                tracing::warn!("UMAC: air-interface encryption: {}", posture);
+            } else {
+                tracing::info!("UMAC: air-interface encryption: {}", posture);
+            }
+        }
         let c = config.config();
         let scrambling_code = scrambler::tetra_scramb_get_init(c.net.mcc, c.net.mnc, c.cell.colour_code);
         let system_wide_services = Self::get_system_wide_services_state(&config);
@@ -95,6 +112,7 @@ impl UmacBs {
         let mut secondary_channel_schedulers = Vec::new();
         if let Some(secondary_carrier) = c.cell.secondary_carrier {
             let mut sched = BsChannelScheduler::new(scrambling_code, precomps.clone());
+            sched.set_aie(aie.clone());
             sched.set_carrier_num(secondary_carrier);
             sched.set_downlink_mode(CarrierDownlinkMode::SecondaryBcchNoMcch);
             secondary_channel_schedulers.push(sched);
@@ -108,7 +126,13 @@ impl UmacBs {
             defrag: BsDefrag::new(),
             pending_stch: None,
             // event_label_store: EventLabelStore::new(),
-            channel_scheduler: BsChannelScheduler::new(scrambling_code, precomps),
+            channel_scheduler: {
+                let mut sched = BsChannelScheduler::new(scrambling_code, precomps);
+                sched.set_aie(aie.clone());
+                sched
+            },
+            aie,
+            ul_encrypted: HashMap::new(),
             secondary_channel_schedulers,
             last_ul_voice: HashMap::new(),
             ul_signal_owner: HashMap::new(),
@@ -182,7 +206,7 @@ impl UmacBs {
             class1_supported: true,
             class2_supported: true,
             class3_supported: false,
-            sck_n: Some(0),
+            sck_n: Some(c.security.aie.as_ref().map(|a| a.sckn).unwrap_or(0)),
             dck_retrieval_during_cell_select: None,
             dck_retrieval_during_cell_reselect: None,
             linked_gck_crypto_periods: None,
@@ -660,15 +684,13 @@ impl UmacBs {
             prim.pdu.dump_bin_full(true)
         );
 
+        let Some(addr) = self.decrypt_uplink(carrier_num, prim.block_num, &mut prim.pdu, pdu.encrypted, addr, is_frag_start, "rx_mac_data") else {
+            return;
+        };
+
         if is_null_pdu {
             // TODO not sure if there is scenarios in which we want to pass a null pdu to the LLC
             // tracing::warn!("rx_mac_data: Null PDU not passed to LLC");
-            return;
-        }
-
-        // Decrypt if needed
-        if pdu.encrypted {
-            unimplemented_log!("rx_mac_data: Encryption mode > 0");
             return;
         }
 
@@ -815,6 +837,11 @@ impl UmacBs {
             prim.pdu.dump_bin_full(true)
         );
 
+        let frag_start = pdu.is_frag_start();
+        let Some(addr) = self.decrypt_uplink(carrier_num, prim.block_num, &mut prim.pdu, pdu.encrypted, addr, frag_start, "rx_mac_access") else {
+            return;
+        };
+
         if pdu.is_null_pdu() {
             // tracing::warn!("rx_mac_access: Null PDU not passed to LLC");
             return;
@@ -864,11 +891,6 @@ impl UmacBs {
         }
 
         // Decrypt if needed
-        if pdu.encrypted {
-            unimplemented_log!("rx_mac_access: Encryption mode > 0");
-            return;
-        }
-
         // Handle reservation if present
         if let Some(res_req) = &pdu.reservation_req {
             let grant_result = self.scheduler_for_mut(carrier_num).ul_process_cap_req(msg_dltime.t, addr, res_req);
@@ -941,6 +963,45 @@ impl UmacBs {
         prim.pdu.set_raw_start(prim.pdu.get_raw_pos());
     }
 
+    /// Undo air-interface encryption on an uplink MAC PDU whose header says it is
+    /// encrypted (EN 300 392-7 clause 6.5.2): the remaining bits — the TM-SDU — are XORed
+    /// with this burst's key stream, and the ESI the radio addressed us with is resolved to
+    /// its real identity. Returns the address to use, or `None` if the PDU must be dropped.
+    fn decrypt_uplink(
+        &mut self,
+        carrier_num: u16,
+        block: PhyBlockNum,
+        pdu_bits: &mut BitBuffer,
+        encrypted: bool,
+        addr: TetraAddress,
+        frag_start: bool,
+        what: &str,
+    ) -> Option<TetraAddress> {
+        let ul_ts = self.dltime.add_timeslots(-2); // the uplink burst was two timeslots ago
+        if !encrypted {
+            self.ul_encrypted.remove(&(carrier_num, ul_ts.t));
+            return Some(addr);
+        }
+        let Some(aie) = self.aie.clone() else {
+            tracing::warn!("{}: encrypted PDU from ESI {} but this cell has no SCK configured — dropped", what, addr.ssi);
+            return None;
+        };
+        let n = pdu_bits.get_len_remaining();
+        aie.apply(pdu_bits, n, ul_ts, true, block);
+        let real = aie.resolve_esi(addr.ssi, SsiType::Issi);
+        tracing::debug!("{}: ESI {} -> ISSI {}, {} bits decrypted", what, addr.ssi, real.ssi, n);
+        if self.scheduler_for_mut(carrier_num).mark_encrypting(real.ssi) {
+            tracing::info!("{}: ISSI {} is encrypting (first encrypted PDU under SCK {})", what, real.ssi, aie.sckn());
+            if let Some(sink) = &self.telemetry {
+                sink.send(TelemetryEvent::MsSecurity { issi: real.ssi, authenticated: None, encrypting: Some(true) });
+            }
+        }
+        if frag_start {
+            self.ul_encrypted.insert((carrier_num, ul_ts.t), true);
+        }
+        Some(real)
+    }
+
     fn rx_mac_frag_ul(&mut self, _queue: &mut MessageQueue, message: &mut SapMsg) {
         tracing::trace!("rx_mac_frag_ul");
         let SapMsgInner::TmvUnitdataInd(prim) = &mut message.msg else {
@@ -986,9 +1047,12 @@ impl UmacBs {
             return;
         };
 
-        if let Some(_aie_info) = self.defrag.get_aie_info(slot_owner, msg_dltime) {
-            unimplemented_log!("rx_mac_frag_ul: Encryption not supported");
-            return;
+        if self.ul_encrypted.get(&(carrier_num, msg_dltime.t)).copied().unwrap_or(false) {
+            if let Some(aie) = self.aie.clone() {
+                let n = prim.pdu.get_len_remaining();
+                aie.apply(&mut prim.pdu, n, msg_dltime, true, prim.block_num);
+                tracing::debug!("rx_mac_frag_ul: decrypted {} bits of an encrypted fragment", n);
+            }
         }
 
         // Insert into defragmenter
@@ -1054,9 +1118,13 @@ impl UmacBs {
             tracing::debug!("rx_mac_end_ul: Received MAC-END-UL for unassigned block {:?}", prim.block_num);
             return;
         };
-        if let Some(_aie_info) = self.defrag.get_aie_info(slot_owner, msg_dltime) {
-            unimplemented_log!("rx_mac_end_ul: Encryption not supported");
-            return;
+        if self.ul_encrypted.get(&(carrier_num, msg_dltime.t)).copied().unwrap_or(false) {
+            if let Some(aie) = self.aie.clone() {
+                let n = prim.pdu.get_len_remaining();
+                aie.apply(&mut prim.pdu, n, msg_dltime, true, prim.block_num);
+                tracing::debug!("rx_mac_end_ul: decrypted {} bits of an encrypted fragment", n);
+            }
+            self.ul_encrypted.remove(&(carrier_num, msg_dltime.t));
         }
 
         // Insert last fragment and retrieve finalized block
@@ -1182,9 +1250,13 @@ impl UmacBs {
             self.scheduler_for(carrier_num).dump_ul_schedule_full(true);
             return;
         };
-        if let Some(_aie_info) = self.defrag.get_aie_info(slot_owner, msg_dltime) {
-            unimplemented_log!("rx_mac_end_hu: Encryption not supported");
-            return;
+        if self.ul_encrypted.get(&(carrier_num, msg_dltime.t)).copied().unwrap_or(false) {
+            if let Some(aie) = self.aie.clone() {
+                let n = prim.pdu.get_len_remaining();
+                aie.apply(&mut prim.pdu, n, msg_dltime, true, prim.block_num);
+                tracing::debug!("rx_mac_end_hu: decrypted {} bits of an encrypted fragment", n);
+            }
+            self.ul_encrypted.remove(&(carrier_num, msg_dltime.t));
         }
 
         // Insert last fragment and retrieve finalized block
@@ -1406,8 +1478,9 @@ impl UmacBs {
                     if hdr_len + sdu_len <= STCH_CAP {
                         // Fits in a single stolen half-slot — one STCH block (unchanged path,
                         // used by small control PDUs and short status/SDS messages).
-                        let mut mac_pdu = mac_pdu;
+                        let mut mac_pdu = self.channel_scheduler.protect_resource_header(mac_pdu);
                         let num_fill_bits = mac_pdu.update_len_and_fill_ind(sdu_len);
+                        let layout = (mac_pdu.encryption_mode != 0).then_some((mac_pdu.compute_header_len(), sdu_len));
 
                         let mut stch_block = BitBuffer::new(STCH_CAP);
                         mac_pdu.to_bitbuf(&mut stch_block);
@@ -1422,7 +1495,7 @@ impl UmacBs {
                             stch_block.get_len()
                         );
 
-                        self.channel_scheduler.dl_enqueue_stealing(ts, stch_block, prim.tx_reporter);
+                        self.channel_scheduler.dl_enqueue_stealing_layout(ts, stch_block, prim.tx_reporter, layout);
                     } else {
                         // Larger than one stolen half-slot: fragment across consecutive stolen
                         // half-slots (panic-safe — a fixed 124-bit buffer used to overflow here and
@@ -1430,12 +1503,15 @@ impl UmacBs {
                         // field radios do not accept an SDS in-band on the traffic channel, so CMCE
                         // defers them to the MCCH (see sds_bs PendingSds). This path now only covers
                         // the rare oversized group/other stealing PDU. (FH-BUG-034.)
+                        let mac_pdu = self.channel_scheduler.protect_resource_header(mac_pdu);
+                        let encrypted = mac_pdu.encryption_mode != 0;
                         let mut fragger = BsFragger::new(mac_pdu, sdu, prim.tx_reporter);
                         let mut produced = 0usize;
                         loop {
                             let mut stch_block = BitBuffer::new(STCH_CAP);
                             let done = fragger.get_next_chunk(&mut stch_block);
-                            self.channel_scheduler.dl_enqueue_stealing(ts, stch_block, None);
+                            let layout = if encrypted { fragger.last_layout() } else { None };
+                            self.channel_scheduler.dl_enqueue_stealing_layout(ts, stch_block, None, layout);
                             produced += 1;
                             if done || produced >= 32 {
                                 break;
@@ -1546,22 +1622,26 @@ impl UmacBs {
                     let hdr_len = mac_pdu.compute_header_len();
 
                     if hdr_len + sdu_len <= STCH_CAP {
-                        let mut mac_pdu = mac_pdu;
+                        let mut mac_pdu = self.scheduler_for(requested_carrier).protect_resource_header(mac_pdu);
                         let num_fill_bits = mac_pdu.update_len_and_fill_ind(sdu_len);
+                        let layout = (mac_pdu.encryption_mode != 0).then_some((mac_pdu.compute_header_len(), sdu_len));
                         let mut stch_block = BitBuffer::new(STCH_CAP);
                         mac_pdu.to_bitbuf(&mut stch_block);
                         sdu.seek(0);
                         stch_block.copy_bits(&mut sdu, sdu_len);
                         fillbits::addition::write(&mut stch_block, Some(num_fill_bits));
                         self.scheduler_for_mut(requested_carrier)
-                            .dl_enqueue_stealing(ts, stch_block, prim.tx_reporter);
+                            .dl_enqueue_stealing_layout(ts, stch_block, prim.tx_reporter, layout);
                     } else {
+                        let mac_pdu = self.scheduler_for(requested_carrier).protect_resource_header(mac_pdu);
+                        let encrypted = mac_pdu.encryption_mode != 0;
                         let mut fragger = BsFragger::new(mac_pdu, sdu, prim.tx_reporter);
                         let mut produced = 0usize;
                         loop {
                             let mut stch_block = BitBuffer::new(STCH_CAP);
                             let done = fragger.get_next_chunk(&mut stch_block);
-                            self.scheduler_for_mut(requested_carrier).dl_enqueue_stealing(ts, stch_block, None);
+                            let layout = if encrypted { fragger.last_layout() } else { None };
+                            self.scheduler_for_mut(requested_carrier).dl_enqueue_stealing_layout(ts, stch_block, None, layout);
                             produced += 1;
                             if done || produced >= 32 {
                                 break;
@@ -1658,7 +1738,16 @@ impl UmacBs {
             SapMsgInner::TmdCircuitDataInd(prim) => {
                 let carrier_num = prim.carrier_num;
                 let ts = prim.ts;
-                let data = prim.data;
+                let mut data = prim.data;
+
+                // Air-interface encryption: the radio's speech frame was encrypted with the
+                // key stream of the uplink burst (two timeslots ago), KSS(0 … 273).
+                if let Some(aie) = &self.aie
+                    && self.scheduler_for(carrier_num).traffic_encrypted()
+                {
+                    let ul_ts = self.dltime.add_timeslots(-2);
+                    aie.apply_bitarr(&mut data, ul_ts, true, PhyBlockNum::Both);
+                }
 
                 // Track last UL voice frame time for inactivity detection
                 if (1..=4).contains(&ts) {

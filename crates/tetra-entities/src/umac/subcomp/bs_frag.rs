@@ -1,9 +1,11 @@
 use std::cmp::min;
+use std::sync::Arc;
 
-use tetra_core::{BitBuffer, TxReporter};
+use tetra_core::{BitBuffer, PhyBlockNum, TdmaTime, TxReporter};
 
 use tetra_pdus::umac::pdus::{mac_end_dl::MacEndDl, mac_frag_dl::MacFragDl, mac_resource::MacResource};
 
+use crate::umac::subcomp::aie::AieCell;
 use crate::umac::subcomp::fillbits;
 
 #[derive(Debug)]
@@ -13,6 +15,15 @@ pub struct BsFragger {
     is_fully_transmitted: bool,
     sdu: BitBuffer,
     tx_reporter: Option<TxReporter>,
+    /// Air-interface encryption for this PDU, if its MAC-RESOURCE header says it is
+    /// encrypted. Each chunk (the MAC-RESOURCE and every MAC-FRAG / MAC-END after it) is a
+    /// MAC PDU of its own and gets its own key stream from the slot it goes out in.
+    cipher: Option<Arc<AieCell>>,
+    /// The slot and half slot the chunk being produced will be transmitted in.
+    chunk_slot: Option<(TdmaTime, PhyBlockNum)>,
+    /// Layout of the chunk last produced: (MAC header bits, TM-SDU bits). Lets a caller that
+    /// cannot know the transmit slot yet (stolen STCH blocks) encrypt the SDU part later.
+    last_layout: Option<(usize, usize)>,
 }
 
 /// We won't start fragmentation if less than MIN_SLOT_CAP_FOR_FRAG_START bits are free in the slot
@@ -32,6 +43,42 @@ impl BsFragger {
             is_fully_transmitted: false,
             sdu,
             tx_reporter,
+            cipher: None,
+            chunk_slot: None,
+            last_layout: None,
+        }
+    }
+
+    /// (MAC header bits, TM-SDU bits) of the chunk last written by `get_next_chunk`.
+    pub fn last_layout(&self) -> Option<(usize, usize)> {
+        self.last_layout
+    }
+
+    /// Encrypt every chunk of this PDU with the cell's key (the header must already carry
+    /// the encryption mode and an ESI address).
+    pub fn set_cipher(&mut self, cipher: Option<Arc<AieCell>>) {
+        self.cipher = cipher;
+    }
+
+    /// As [`BsFragger::get_next_chunk`], for a chunk that will be sent in slot `ts` (and,
+    /// for half-slot channels, in `block`). Needed for encryption: the key stream depends
+    /// on the slot numbering of the burst.
+    pub fn get_next_chunk_at(&mut self, mac_block: &mut BitBuffer, ts: TdmaTime, block: PhyBlockNum) -> bool {
+        self.chunk_slot = Some((ts, block));
+        let done = self.get_next_chunk(mac_block);
+        self.chunk_slot = None;
+        done
+    }
+
+    /// XOR the next `num_bits` of the SDU with this chunk's key stream, in place, before
+    /// they are copied into the MAC block (EN 300 392-7 clause 6.4: KSS restarts at every
+    /// MAC PDU, the header and fill bits stay clear).
+    fn protect_next(&mut self, num_bits: usize, header_bits: usize) {
+        self.last_layout = Some((header_bits, num_bits));
+        if let (Some(cipher), Some((ts, block))) = (&self.cipher, self.chunk_slot) {
+            cipher.apply(&mut self.sdu, num_bits, ts, false, block);
+        } else if self.cipher.is_some() {
+            tracing::error!("BsFragger: encrypted PDU produced without a slot time — sent in CLEAR with an encrypted header");
         }
     }
 
@@ -81,6 +128,7 @@ impl BsFragger {
 
             // Write MAC-RESOURCE header, followed by TM-SDU, to MAC block
             self.resource.to_bitbuf(mac_block);
+            self.protect_next(sdu_len_bits, mac_block.get_len_written());
             mac_block.copy_bits(&mut self.sdu, sdu_len_bits);
             fillbits::addition::write(mac_block, Some(num_fill_bits));
 
@@ -112,6 +160,7 @@ impl BsFragger {
             );
 
             self.resource.to_bitbuf(mac_block);
+            self.protect_next(sdu_bits, mac_block.get_len_written());
             mac_block.copy_bits(&mut self.sdu, sdu_bits);
             fillbits::addition::write(mac_block, None);
 
@@ -158,6 +207,7 @@ impl BsFragger {
 
             // Write MAC-END header followed by TM-SDU
             pdu.to_bitbuf(mac_block);
+            self.protect_next(sdu_bits, mac_block.get_len_written());
             mac_block.copy_bits(&mut self.sdu, sdu_bits);
 
             // Write fill bits (if needed)
@@ -190,6 +240,7 @@ impl BsFragger {
             );
 
             pdu.to_bitbuf(mac_block);
+            self.protect_next(sdu_bits_in_frag, mac_block.get_len_written());
             mac_block.copy_bits(&mut self.sdu, sdu_bits_in_frag);
 
             if num_fill_bits > 0 {

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use crate::mm::components::recovery_cache::{RecoveryCache, TerminalRecord};
 use crate::net_control::{ControlCommand, ControlEndpoint};
@@ -15,6 +16,9 @@ use tetra_saps::{SapMsg, SapMsgInner};
 use crate::mm::components::client_state::{ClientMgrErr, MmClientMgr, MmClientState};
 use crate::mm::components::not_supported::make_ul_mm_pdu_function_not_supported;
 use tetra_pdus::cmce::ss_dgna::enums::results::GroupIdentityAttachmentMode;
+use tetra_config::bluestation::sec_security::AuthenticationMode;
+use tetra_pdus::mm::enums::authentication_reject_reason::AuthenticationRejectReason;
+use tetra_pdus::mm::enums::authentication_sub_type::AuthenticationSubType;
 use tetra_pdus::mm::enums::energy_saving_mode::EnergySavingMode;
 use tetra_pdus::mm::enums::location_update_type::LocationUpdateType;
 use tetra_pdus::mm::enums::mm_pdu_type_ul::MmPduTypeUl;
@@ -27,7 +31,13 @@ use tetra_pdus::mm::fields::group_identity_downlink::GroupIdentityDownlink;
 use tetra_pdus::mm::fields::group_identity_location_accept::GroupIdentityLocationAccept;
 use tetra_pdus::mm::fields::group_identity_uplink::GroupIdentityUplink;
 use tetra_pdus::mm::pdus::d_attach_detach_group_identity::DAttachDetachGroupIdentity;
+use tetra_pdus::mm::pdus::authentication::{
+    DAuthenticationDemand, DAuthenticationReject, DAuthenticationResponse, DAuthenticationResult, UAuthenticationDemand,
+    UAuthenticationReject, UAuthenticationResponse, UAuthenticationResult, peek_sub_type,
+};
 use tetra_pdus::mm::pdus::d_attach_detach_group_identity_acknowledgement::DAttachDetachGroupIdentityAcknowledgement;
+use tetra_security::auth::{MsChallenge, answer_ms_challenge, derive_dck, random_nonce};
+use tetra_security::keys::AuthKey;
 use tetra_pdus::mm::pdus::d_location_update_accept::DLocationUpdateAccept;
 use tetra_pdus::mm::pdus::d_location_update_command::DLocationUpdateCommand;
 use tetra_pdus::mm::pdus::d_location_update_reject::DLocationUpdateReject;
@@ -62,7 +72,33 @@ pub struct MmBs {
     /// ghost while it re-registers (see `maybe_reactive_recovery`). Independent of `recovery`
     /// above â€” populated even when the proactive cache is disabled.
     reactive_recovery_cooldown: HashMap<u32, std::time::Instant>,
+
+    // ── Air-interface authentication (EN 300 392-7 clause 4.1) ───────────────────────────────
+    /// Challenges we have issued and are waiting on, by ISSI. A registration that triggered the
+    /// challenge is held here and replayed once the radio has answered correctly.
+    auth_pending: HashMap<u32, PendingAuth>,
+    /// ISSIs that passed authentication a moment ago, so their held registration may proceed.
+    auth_passed: HashMap<u32, Instant>,
+    /// Derived cipher key (TB4 of DCK1/DCK2) from each radio's last successful exchange, kept
+    /// for air-interface encryption once that lands.
+    dck: HashMap<u32, [u8; 10]>,
 }
+
+/// An authentication exchange in progress with one radio.
+struct PendingAuth {
+    challenge: MsChallenge,
+    /// L2 handle the challenge went out on.
+    handle: u32,
+    /// The U-LOCATION UPDATE DEMAND that is waiting for the result, if the challenge was part
+    /// of a registration.
+    held: Option<SapMsg>,
+    started: Instant,
+}
+
+/// T354 (EN 300 392-7 Annex C): how long an authentication exchange may take.
+const T354: Duration = Duration::from_secs(30);
+/// How long a successful authentication stays valid for the held registration to go through.
+const AUTH_PASS_GRACE: Duration = Duration::from_secs(5);
 
 /// Safety cap on `reactive_recovery_cooldown` so a churn of distinct unknown ISSIs can't grow it
 /// without bound; lapsed entries are pruned once this many are held.
@@ -78,10 +114,15 @@ impl MmBs {
             // State the effective posture in the operator log. There is no way to read it off the
             // TOML alone (an empty issi_whitelist means "open" under the legacy default), and the
             // air interface is unauthenticated regardless — so say both, once, unmissably.
-            tracing::warn!(
-                "MM: access control posture: {} | air-interface authentication (EN 300 392-7 TEA) is NOT implemented — any radio can claim any ISSI; the whitelist is the only gate",
-                sec.access_control_posture()
-            );
+            tracing::warn!("MM: access control posture: {}", sec.access_control_posture());
+            if sec.authentication == AuthenticationMode::Off {
+                tracing::warn!(
+                    "MM: authentication posture: {} — any radio can claim any ISSI; the whitelist is the only gate (set [security] authentication and subscriber keys to challenge radios)",
+                    sec.authentication_posture()
+                );
+            } else {
+                tracing::info!("MM: authentication posture: {}", sec.authentication_posture());
+            }
             if sec.honour_unauthenticated_detach {
                 tracing::warn!(
                     "MM: honouring unauthenticated U-ITSI-DETACH / migration teardown (only from an ISSI registered on the same link) — set [security] honour_unauthenticated_detach = false to refuse it entirely"
@@ -98,6 +139,9 @@ impl MmBs {
             recovery_attempts: HashMap::new(),
             recovery_last_frame: None,
             reactive_recovery_cooldown: HashMap::new(),
+            auth_pending: HashMap::new(),
+            auth_passed: HashMap::new(),
+            dck: HashMap::new(),
         }
     }
 
@@ -460,6 +504,8 @@ impl MmBs {
 
     fn rx_u_location_update_demand(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         tracing::trace!("rx_location_update_demand");
+        // Kept unparsed so it can be replayed once the radio has authenticated.
+        let unparsed = message.clone();
         let SapMsgInner::LmmMleUnitdataInd(prim) = &mut message.msg else {
             tracing::error!("BUG: unexpected message or state -- routing error");
             return;
@@ -496,6 +542,13 @@ impl MmBs {
                 pdu.address_extension,
                 RejectCause::ItsiAtsiUnknown,
             );
+            return;
+        }
+
+        // Air-interface authentication: challenge the radio and hold its registration until it
+        // has answered correctly (EN 300 392-7 clause 4.4.2, "authentication as part of the
+        // registration procedure").
+        if self.authentication_gate(queue, issi, handle, pdu.location_update_type, pdu.address_extension, unparsed) {
             return;
         }
 
@@ -1301,7 +1354,7 @@ impl MmBs {
         };
 
         match pdu_type {
-            MmPduTypeUl::UAuthentication => unimplemented_log!("UAuthentication"),
+            MmPduTypeUl::UAuthentication => self.rx_u_authentication(queue, message),
             MmPduTypeUl::UItsiDetach => self.rx_u_itsi_detach(queue, message),
             MmPduTypeUl::ULocationUpdateDemand => self.rx_u_location_update_demand(queue, message),
             MmPduTypeUl::UMmStatus => self.rx_u_mm_status(queue, message),
@@ -2063,6 +2116,7 @@ impl TetraEntityTrait for MmBs {
     }
 
     fn tick_start(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
+        self.expire_authentication();
         // Drain control commands addressed to the MM entity. We collect into a Vec first so the
         // immutable borrow on `self.control` is released before the handlers run â€” DGNA needs
         // `&mut self` (client registry, subscriber state, telemetry).
@@ -2389,6 +2443,257 @@ impl MmBs {
         }
     }
 }
+
+// ─────────────────────── Air-interface authentication (EN 300 392-7) ───────────────────────
+impl MmBs {
+    /// Decide whether a registering radio must authenticate first. Returns true when the
+    /// registration has been taken over (challenge sent and the message held, or rejected).
+    fn authentication_gate(
+        &mut self,
+        queue: &mut MessageQueue,
+        issi: u32,
+        handle: u32,
+        location_update_type: LocationUpdateType,
+        address_extension: Option<u64>,
+        held: SapMsg,
+    ) -> bool {
+        let (mode, k) = {
+            let cfg = self.config.config();
+            (cfg.security.authentication, cfg.security.subscriber_k(issi).copied())
+        };
+        if mode == AuthenticationMode::Off {
+            return false;
+        }
+        // Just authenticated: let the replayed registration through.
+        if self.auth_passed.get(&issi).is_some_and(|t| t.elapsed() < AUTH_PASS_GRACE) {
+            self.auth_passed.remove(&issi);
+            return false;
+        }
+        let Some(k) = k else {
+            if mode == AuthenticationMode::Required {
+                tracing::warn!("MM: ISSI {} has no authentication key and authentication is required — rejecting registration", issi);
+                Self::send_d_location_update_reject_cause(queue, issi, handle, location_update_type, address_extension, RejectCause::IllegalMs);
+                return true;
+            }
+            tracing::debug!("MM: ISSI {} has no authentication key — registering unauthenticated (authentication = optional)", issi);
+            return false;
+        };
+        // A challenge is already out: keep the newest registration to replay, don't re-challenge.
+        if let Some(p) = self.auth_pending.get_mut(&issi)
+            && p.started.elapsed() < T354
+        {
+            p.held = Some(held);
+            return true;
+        }
+        let challenge = MsChallenge::new(&AuthKey(k));
+        let pdu = DAuthenticationDemand { rand1: challenge.rand1, rs: challenge.rs, proprietary: None };
+        tracing::info!("MM: challenging ISSI {} (D-AUTHENTICATION DEMAND)", issi);
+        self.send_auth_pdu(queue, issi, handle, "DAuthenticationDemand", |b| pdu.to_bitbuf(b));
+        self.auth_pending.insert(issi, PendingAuth { challenge, handle, held: Some(held), started: Instant::now() });
+        true
+    }
+
+    /// U-AUTHENTICATION: dispatch on the sub-type that follows the PDU type.
+    fn rx_u_authentication(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
+        let SapMsgInner::LmmMleUnitdataInd(prim) = &mut message.msg else {
+            tracing::error!("BUG: unexpected message or state -- routing error");
+            return;
+        };
+        let issi = prim.received_address.ssi;
+        let handle = prim.handle;
+        let Some(sub_type) = peek_sub_type(&prim.sdu) else {
+            tracing::warn!("MM: truncated U-AUTHENTICATION from ISSI {}", issi);
+            return;
+        };
+        match sub_type {
+            AuthenticationSubType::Response => match UAuthenticationResponse::from_bitbuf(&mut prim.sdu) {
+                Ok(pdu) => self.rx_u_authentication_response(queue, issi, handle, pdu),
+                Err(e) => tracing::warn!("MM: bad U-AUTHENTICATION RESPONSE from ISSI {}: {:?}", issi, e),
+            },
+            AuthenticationSubType::Demand => match UAuthenticationDemand::from_bitbuf(&mut prim.sdu) {
+                Ok(pdu) => self.rx_u_authentication_demand(queue, issi, handle, pdu),
+                Err(e) => tracing::warn!("MM: bad U-AUTHENTICATION DEMAND from ISSI {}: {:?}", issi, e),
+            },
+            AuthenticationSubType::Result => match UAuthenticationResult::from_bitbuf(&mut prim.sdu) {
+                Ok(pdu) => self.rx_u_authentication_result(queue, issi, handle, pdu),
+                Err(e) => tracing::warn!("MM: bad U-AUTHENTICATION RESULT from ISSI {}: {:?}", issi, e),
+            },
+            AuthenticationSubType::Reject => match UAuthenticationReject::from_bitbuf(&mut prim.sdu) {
+                Ok(pdu) => self.rx_u_authentication_reject(queue, issi, handle, pdu),
+                Err(e) => tracing::warn!("MM: bad U-AUTHENTICATION REJECT from ISSI {}: {:?}", issi, e),
+            },
+        }
+    }
+
+    /// The radio answers our challenge (clause 4.1.2), possibly adding its own (4.1.4).
+    /// Tell the dashboard (and other telemetry consumers) that this radio proved its K.
+    fn notify_authenticated(&self, issi: u32) {
+        if let Some(sink) = &self.telemetry {
+            sink.send(crate::net_telemetry::TelemetryEvent::MsSecurity { issi, authenticated: Some(true), encrypting: None });
+        }
+    }
+
+    fn rx_u_authentication_response(&mut self, queue: &mut MessageQueue, issi: u32, handle: u32, pdu: UAuthenticationResponse) {
+        let Some(pending) = self.auth_pending.remove(&issi) else {
+            tracing::warn!("MM: U-AUTHENTICATION RESPONSE from ISSI {} but no challenge is outstanding — ignored", issi);
+            return;
+        };
+        let dck1 = pending.challenge.verify(&pdu.res1);
+        let r1 = dck1.is_some();
+        // Mutual: the radio challenged us with RAND2 under the same RS.
+        let (res2, dck2) = match (pdu.rand2, self.subscriber_key(issi)) {
+            (Some(rand2), Some(k)) => {
+                let r = answer_ms_challenge(&k, &pending.challenge.rs, &rand2);
+                (Some(r.res2), Some(r.dck2))
+            }
+            _ => (None, None),
+        };
+        let result = DAuthenticationResult { r1, res2, proprietary: None };
+        self.send_auth_pdu(queue, issi, handle, "DAuthenticationResult", |b| result.to_bitbuf(b));
+        if r1 {
+            tracing::info!("MM: ISSI {} authenticated{}", issi, if res2.is_some() { " (mutual)" } else { "" });
+            self.dck.insert(issi, derive_dck(dck1.as_ref(), dck2.as_ref()).0);
+            self.auth_passed.insert(issi, Instant::now());
+            self.notify_authenticated(issi);
+            if let Some(held) = pending.held {
+                self.rx_u_location_update_demand(queue, held);
+            }
+        } else {
+            tracing::warn!("MM: ISSI {} FAILED authentication (wrong RES1) — registration rejected", issi);
+            if let Some(held) = pending.held {
+                self.reject_held_registration(queue, issi, handle, held);
+            }
+        }
+    }
+
+    /// The radio challenges us (clause 4.1.3): answer with RES2 and, if configured, challenge
+    /// back so the exchange becomes mutual.
+    fn rx_u_authentication_demand(&mut self, queue: &mut MessageQueue, issi: u32, handle: u32, pdu: UAuthenticationDemand) {
+        let mutual = self.config.config().security.mutual_authentication;
+        let Some(k) = self.subscriber_key(issi) else {
+            tracing::info!("MM: ISSI {} asked us to authenticate but has no key configured — D-AUTHENTICATION REJECT", issi);
+            let reject = DAuthenticationReject { reject_reason: AuthenticationRejectReason::AuthenticationNotSupported };
+            self.send_auth_pdu(queue, issi, handle, "DAuthenticationReject", |b| reject.to_bitbuf(b));
+            return;
+        };
+        let rs = random_nonce();
+        let answer = answer_ms_challenge(&k, &rs, &pdu.rand2);
+        let rand1 = if mutual {
+            let challenge = MsChallenge::with_nonces(&k, rs, random_nonce());
+            let rand1 = challenge.rand1;
+            self.auth_pending.insert(issi, PendingAuth { challenge, handle, held: None, started: Instant::now() });
+            Some(rand1)
+        } else {
+            self.dck.insert(issi, derive_dck(None, Some(&answer.dck2)).0);
+            None
+        };
+        tracing::info!("MM: answering ISSI {}'s challenge (D-AUTHENTICATION RESPONSE{})", issi, if mutual { ", mutual" } else { "" });
+        let response = DAuthenticationResponse { rs, res2: answer.res2, rand1, proprietary: None };
+        self.send_auth_pdu(queue, issi, handle, "DAuthenticationResponse", |b| response.to_bitbuf(b));
+    }
+
+    /// The radio's verdict on our RES2 and, in a mutual exchange it started, its RES1.
+    fn rx_u_authentication_result(&mut self, queue: &mut MessageQueue, issi: u32, handle: u32, pdu: UAuthenticationResult) {
+        if !pdu.r2 {
+            tracing::warn!("MM: ISSI {} reports our authentication FAILED (R2 = false) — its K does not match ours", issi);
+        }
+        let Some(res1) = pdu.res1 else {
+            return;
+        };
+        let Some(pending) = self.auth_pending.remove(&issi) else {
+            tracing::warn!("MM: U-AUTHENTICATION RESULT with RES1 from ISSI {} but no challenge is outstanding", issi);
+            return;
+        };
+        let dck1 = pending.challenge.verify(&res1);
+        let r1 = dck1.is_some();
+        let result = DAuthenticationResult { r1, res2: None, proprietary: None };
+        self.send_auth_pdu(queue, issi, handle, "DAuthenticationResult", |b| result.to_bitbuf(b));
+        if r1 {
+            tracing::info!("MM: ISSI {} authenticated (mutual, radio-initiated)", issi);
+            self.dck.insert(issi, derive_dck(dck1.as_ref(), None).0);
+            self.auth_passed.insert(issi, Instant::now());
+            self.notify_authenticated(issi);
+        } else {
+            tracing::warn!("MM: ISSI {} FAILED our challenge in a radio-initiated exchange", issi);
+        }
+    }
+
+    /// The radio refuses to authenticate.
+    fn rx_u_authentication_reject(&mut self, queue: &mut MessageQueue, issi: u32, handle: u32, pdu: UAuthenticationReject) {
+        let mode = self.config.config().security.authentication;
+        tracing::warn!("MM: ISSI {} rejected authentication ({:?})", issi, pdu.reject_reason);
+        let Some(pending) = self.auth_pending.remove(&issi) else {
+            return;
+        };
+        if let Some(held) = pending.held {
+            if mode == AuthenticationMode::Required {
+                self.reject_held_registration(queue, issi, handle, held);
+            } else {
+                tracing::info!("MM: ISSI {} registers unauthenticated (authentication = optional)", issi);
+                self.auth_passed.insert(issi, Instant::now());
+                self.rx_u_location_update_demand(queue, held);
+            }
+        }
+    }
+
+    /// Give up on exchanges that have outrun T354 and forget stale passes.
+    fn expire_authentication(&mut self) {
+        let expired: Vec<u32> = self.auth_pending.iter().filter(|(_, p)| p.started.elapsed() > T354).map(|(i, _)| *i).collect();
+        for issi in expired {
+            tracing::warn!("MM: authentication of ISSI {} timed out (T354) — no response to the challenge", issi);
+            self.auth_pending.remove(&issi);
+        }
+        self.auth_passed.retain(|_, t| t.elapsed() < AUTH_PASS_GRACE);
+    }
+
+    fn subscriber_key(&self, issi: u32) -> Option<AuthKey> {
+        self.config.config().security.subscriber_k(issi).map(|k| AuthKey(*k))
+    }
+
+    /// Reject the registration that was held for an authentication that failed.
+    fn reject_held_registration(&self, queue: &mut MessageQueue, issi: u32, handle: u32, held: SapMsg) {
+        let SapMsgInner::LmmMleUnitdataInd(prim) = held.msg else {
+            return;
+        };
+        let mut sdu = prim.sdu;
+        let (lut, addr) = match ULocationUpdateDemand::from_bitbuf(&mut sdu) {
+            Ok(p) => (p.location_update_type, p.address_extension),
+            Err(_) => (LocationUpdateType::RoamingLocationUpdating, None),
+        };
+        Self::send_d_location_update_reject_cause(queue, issi, handle, lut, addr, RejectCause::IllegalMs);
+    }
+
+    /// Send one MM PDU to a radio over the acknowledged L2 service.
+    fn send_auth_pdu<F>(&self, queue: &mut MessageQueue, issi: u32, handle: u32, what: &str, write: F)
+    where
+        F: FnOnce(&mut BitBuffer) -> Result<(), tetra_core::pdu_parse_error::PduParseErr>,
+    {
+        let mut sdu = BitBuffer::new_autoexpand(256);
+        if let Err(e) = write(&mut sdu) {
+            tracing::error!("MM: failed to encode {} for ISSI {}: {:?}", what, issi, e);
+            return;
+        }
+        sdu.seek(0);
+        tracing::debug!("-> {} to ISSI {}", what, issi);
+        queue.push_back(SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                sdu,
+                handle,
+                address: TetraAddress::issi(issi),
+                layer2service: Layer2Service::Acknowledged,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                encryption_flag: false,
+                is_null_pdu: false,
+                tx_reporter: None,
+            }),
+        });
+    }
+}
+
 
 #[cfg(test)]
 mod ee_tests {
