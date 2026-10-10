@@ -574,6 +574,9 @@ body{
 .lst-scan-chip .lst-scan-num{font-weight:700;letter-spacing:0.02em;color:inherit;}
 .lst-scan-chip .lst-scan-name{font-family:var(--font,inherit);font-weight:600;color:inherit;}
 .lst-scan-chip .lst-scan-name+.lst-scan-num{font-weight:500;opacity:0.85;}
+.lst-scan-chip .lst-scan-talker{font-family:var(--font,inherit);font-weight:600;opacity:0.95;}
+.lst-scan-chip .lst-scan-talker::before{content:"\25B6\00a0";font-size:10px;}
+.callsign.is-local{font-style:normal;}
 .lst-scan-row .lst-scan-name-input{flex:1.4 1 0;}
 .lst-scan-tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px;}
 .lst-scan-tools .help-text{margin:0;}
@@ -7359,6 +7362,7 @@ const LANGS={
     lst_scan_name_ph:'Name (optional)',lst_scan_import:'Import file',lst_scan_export:'Export',
     lst_scan_file_hint:'One TG per line: World Wide (91), World Wide,91 or 91,World Wide. CSV, TXT or JSON.',
     lst_scan_imported:'Imported {n} TGs ({added} new)',lst_scan_import_err:'No talkgroups found in that file',
+    radio_name_btn:'Name',radio_name_title:'Radio name',radio_name_prompt:'Name for ISSI {issi}, shown wherever this radio appears. Leave empty to remove.',radio_name_ph:'e.g. Dave MM7FDM',
     lst_scan_hint:'Mark one TG as TX (primary). Other TGs are listened with lower priority.',
     lst_ptt_space:'Spacebar',
     lst_ptt_busy:'Press again to interrupt (3s)',
@@ -7821,6 +7825,7 @@ const LANGS={
     lst_scan_name_ph:'Nombre (opcional)',lst_scan_import:'Importar archivo',lst_scan_export:'Exportar',
     lst_scan_file_hint:'Un TG por línea: World Wide (91), World Wide,91 o 91,World Wide. CSV, TXT o JSON.',
     lst_scan_imported:'{n} TGs importados ({added} nuevos)',lst_scan_import_err:'No se encontraron grupos en ese archivo',
+    radio_name_btn:'Nombre',radio_name_title:'Nombre de la radio',radio_name_prompt:'Nombre para el ISSI {issi}; se muestra donde aparezca esta radio. Déjalo vacío para quitarlo.',radio_name_ph:'p. ej. Dave MM7FDM',
     lst_scan_hint:'Marca un TG como TX (principal). El resto se escucha con menor prioridad.',
     lst_ptt_space:'Barra espaciadora',
     lst_ptt_busy:'Pulsa otra vez para interrumpir (3s)',
@@ -8678,8 +8683,15 @@ let lstUlAcc=null,lstDlQueue=null,lstDlRead=0,lstDlProc=null;
 let lstDlViaWs=false,lstUlNode=null,lstDlNode=null,lstUlSrc=null,lstDlGain=null;
 let lstCallPeer=0,lstCallTab='sx';
 let lstLastStatus=null,lstTimerFrozenSecs=null,lstTimerTick=null;
-let lstScanList=[],lstScanTx=0,lstRxGssi=0,lstSpaceBound=false,lstSpaceDown=false;
+let lstScanList=[],lstScanTx=0,lstRxGssi=0,lstRxIssi=0,lstSpaceBound=false,lstSpaceDown=false;
 let lstScanNames={};
+// "Dave (2358245)" when the radio has a name, else the ISSI.
+function lstIssiLabel(issi){
+  issi=Number(issi)||0;
+  if(!issi)return '';
+  const c=(typeof callsigns!=='undefined')?callsigns[issi]:null;
+  return (c&&c.cs)?(c.cs+' ('+issi+')'):String(issi);
+}
 const LST_FRAME_SAMPLES=480; // 60 ms @ 8 kHz = one TETRA ACELP block
 function lstScanStorageKey(){return 'fs_lst_scan_'+location.host;}
 function lstLoadScan(){
@@ -8813,8 +8825,9 @@ function lstRenderScan(){
     const mic=isTx?'<span class="lst-scan-mic" data-icon="mic" aria-hidden="true"></span>':'';
     const name=lstScanNames[g]?('<span class="lst-scan-name">'+escapeHtml(lstScanNames[g])+'</span>'):'';
     const num=name?('<span class="lst-scan-num">('+g+')</span>'):('<span class="lst-scan-num">'+g+'</span>');
-    return '<span class="'+cls+'" data-gssi="'+g+'" title="'+escapeHtml(lstGssiLabel(g))+(isTx?(' · '+t('lst_scan_tx')):'')+'">'+
-      mic+name+num+
+    const talker=(isRx&&lstRxIssi)?('<span class="lst-scan-talker">'+escapeHtml(lstIssiLabel(lstRxIssi))+'</span>'):'';
+    return '<span class="'+cls+'" data-gssi="'+g+'" title="'+escapeHtml(lstGssiLabel(g))+(isTx?(' · '+t('lst_scan_tx')):'')+(talker?(' · '+escapeHtml(lstIssiLabel(lstRxIssi))):'')+'">'+
+      mic+name+num+talker+
       '<button type="button" data-rm="'+g+'" title="'+t('lst_scan_remove')+'">×</button></span>';
   }).join('');
   el.querySelectorAll('.lst-scan-chip').forEach(chip=>{
@@ -8957,6 +8970,8 @@ function lstApplyStatusPayload(j){
   }
   const nextRx=Number(j.rx_gssi)||0;
   if(nextRx!==lstRxGssi){lstRxGssi=nextRx;}
+  const nextRxIssi=Number(j.rx_issi)||0;
+  if(nextRxIssi!==lstRxIssi){lstRxIssi=nextRxIssi;if(nextRxIssi&&typeof callsigns!=='undefined'&&callsigns[nextRxIssi]===undefined&&typeof refreshCallsigns==='function')refreshCallsigns();}
   if(j.rx_draining){lstRxUntil=Date.now()+900;}
   lstRenderScan();
   const iOwn=!!lstToken;
@@ -10024,7 +10039,8 @@ function lstRenderRoster(){
       `<td>`+
         `<button type="button" class="btn btn-sm" data-issi="${m.issi}" data-act="sds" title="${sdsTitle}">${sdsLbl}</button> `+
         `<button type="button" class="btn btn-sm" data-issi="${m.issi}" data-act="dgna" title="${dgnaTitle}">${dgnaLbl}</button> `+
-        `<button type="button" class="btn btn-sm" data-issi="${m.issi}" data-act="call" title="${callTitle}">${callLbl}</button>`+
+        `<button type="button" class="btn btn-sm" data-issi="${m.issi}" data-act="call" title="${callTitle}">${callLbl}</button> `+
+        `<button type="button" class="btn btn-sm" data-issi="${m.issi}" data-act="name" title="${t('radio_name_title')}">${t('radio_name_btn')}</button>`+
       `</td>`;
     tb.appendChild(tr);
   });
@@ -10041,6 +10057,7 @@ function lstRenderRoster(){
       if(btn.dataset.act==='sds')lstOpenSds(issi);
       else if(btn.dataset.act==='dgna')openDgna(issi);
       else if(btn.dataset.act==='call')openLstCallModal(issi);
+      else if(btn.dataset.act==='name')editRadioName(issi);
     };
   });
 }
@@ -10466,8 +10483,28 @@ let dgnaUi={selectedGssi:0,targetChecks:{},statusLog:[],lastByIssi:{}};
 //       | "" (looked up, none). A missing key means unresolved.
 let callsigns={};
 let _csInflight=false;
-// Render an ISSI with its RadioID callsign (and country flag, when known) appended.
-function idCell(issi){const c=callsigns[issi];if(!c||!c.cs)return `<code>${issi}</code>`;const fl=c.fl?c.fl+' ':'';return `<code>${issi}</code> <span class="callsign">${fl}${escHtml(c.cs)}</span>`;}
+// Render an ISSI with its name (operator-assigned) or RadioID callsign (and country flag) appended.
+function idCell(issi){const c=callsigns[issi];if(!c||!c.cs)return `<code>${issi}</code>`;const fl=c.fl?c.fl+' ':'';return `<code>${issi}</code> <span class="callsign${c.local?' is-local':''}">${fl}${escHtml(c.cs)}</span>`;}
+// Operator-assigned radio names (ISSI → name): stored on the station (radio_names.json) and
+// served ahead of RadioID callsigns, so they show wherever an ISSI appears.
+async function editRadioName(issi){
+  issi=Number(issi)||0;
+  if(!issi)return;
+  const cur=(callsigns[issi]&&callsigns[issi].local)?callsigns[issi].cs:'';
+  const v=await dashPrompt({title:t('radio_name_title'),body:t('radio_name_prompt',{issi:String(issi)}),value:cur,placeholder:t('radio_name_ph'),type:'text',maxLength:40});
+  if(v===null)return;
+  const name=String(v).trim().slice(0,40);
+  try{
+    const r=await fetch('/api/radio-names',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({issi,name})});
+    if(!r.ok)return;
+    if(name)callsigns[issi]={cs:name,fl:'',local:true};
+    else delete callsigns[issi];
+    renderStations();renderCalls();renderLastHeard();renderSdsLog();
+    if(typeof lstRenderRoster==='function')lstRenderRoster();
+    if(typeof lstRenderScan==='function')lstRenderScan();
+    if(!name&&typeof refreshCallsigns==='function')refreshCallsigns();
+  }catch(_){}
+}
 // Resolve callsigns for every ISSI currently on screen we have not looked up yet. On-demand: the
 // server fetches unknowns from RadioID in the background and caches them locally; pending IDs are
 // omitted from the response and retried on the next tick. Found/absent results are cached here.
@@ -11460,7 +11497,7 @@ function renderStations(){
       <td>${secCell(m)}</td>
       <td><span class="pill pill-ok">${t('online_badge')}</span></td>
       <td class="col-mobile-hide">${lastSeenLabel(ls)}</td>
-      <td><button class="btn btn-sm" onclick="openSds(${m.issi})">${t('sds')}</button> <button class="btn btn-sm" onclick="openDgna(${m.issi})" title="${t('dgna_title')}">${t('dgna')}</button> <button class="btn btn-sm btn-danger" onclick="kickMs(${m.issi})">${t('kick')}</button>${emg?` <button class="btn btn-sm btn-danger" onclick="clearEmergency(${m.issi})">${t('emg_clear')}</button>`:''}</td>
+      <td><button class="btn btn-sm" onclick="openSds(${m.issi})">${t('sds')}</button> <button class="btn btn-sm" onclick="openDgna(${m.issi})" title="${t('dgna_title')}">${t('dgna')}</button> <button class="btn btn-sm" onclick="editRadioName(${m.issi})" title="${t('radio_name_title')}">${t('radio_name_btn')}</button> <button class="btn btn-sm btn-danger" onclick="kickMs(${m.issi})">${t('kick')}</button>${emg?` <button class="btn btn-sm btn-danger" onclick="clearEmergency(${m.issi})">${t('emg_clear')}</button>`:''}</td>
     </tr>`;
   }).join('');
   applyTableStackLabels(tb);
@@ -13467,9 +13504,14 @@ function dashPrompt(opts){
   if(body)body.textContent=opts.body||'';
   if(ok)ok.textContent=opts.confirmLabel||t('confirm');
   if(input){
+    // Numeric by default (ISSI/GSSI prompts); opts.type='text' for free text such as names.
+    const asText=opts.type==='text';
+    input.type=asText?'text':'number';
+    input.inputMode=asText?'text':'numeric';
+    if(asText)input.removeAttribute('min');else input.min=opts.min!=null?opts.min:1;
+    input.maxLength=asText?(opts.maxLength||40):524288;
     input.value=(opts.value!=null&&opts.value!=='')?String(opts.value):'';
-    input.min=opts.min!=null?opts.min:1;
-    if(opts.placeholder)input.placeholder=opts.placeholder;
+    input.placeholder=opts.placeholder||'';
   }
   return new Promise(resolve=>{
     _dashPromptResolve=resolve;

@@ -3338,6 +3338,26 @@ fn handle_connection(
                 Err(e) => http_response(buf.into_inner(), 500, &e),
             },
         }
+    } else if req_line.contains("GET /api/radio-names") {
+        let mut s = stream;
+        drain_http_headers(&mut s);
+        http_json_response(s, 200, &radio_names_json(&radioid));
+    } else if req_line.contains("POST /api/radio-names") {
+        let (inner, body_str) = read_post_body(stream);
+        match serde_json::from_str::<serde_json::Value>(&body_str) {
+            Ok(v) => {
+                let issi = v.get("issi").and_then(|i| i.as_u64()).unwrap_or(0);
+                let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                if issi == 0 || issi > 16_777_214 {
+                    http_response(inner, 400, "invalid issi");
+                } else {
+                    radioid.set_local_name(issi as u32, name);
+                    tracing::info!("Dashboard: radio name for ISSI {} set to {:?}", issi, name.trim());
+                    http_json_response(inner, 200, &radio_names_json(&radioid));
+                }
+            }
+            Err(e) => http_response(inner, 400, &format!("invalid JSON: {e}")),
+        }
     } else if req_line.contains("GET /api/callsigns") {
         let mut buf = BufReader::new(stream);
         loop {
@@ -5054,6 +5074,15 @@ fn serve_callsigns(stream: PrefixedConn, radioid: &crate::net_dashboard::radioid
 
     let mut map = serde_json::Map::new();
     for id in ids {
+        // An operator-assigned name wins over the RadioID callsign.
+        if let Some(name) = radioid.local_name(id) {
+            let mut entry = serde_json::Map::new();
+            entry.insert("cs".to_string(), serde_json::Value::String(name));
+            entry.insert("fl".to_string(), serde_json::Value::String(String::new()));
+            entry.insert("local".to_string(), serde_json::Value::Bool(true));
+            map.insert(id.to_string(), serde_json::Value::Object(entry));
+            continue;
+        }
         match radioid.get(id) {
             Lookup::Found(cs) => {
                 let flag = crate::net_dashboard::callsign::callsign_flag(&cs).unwrap_or_default();
@@ -5069,6 +5098,15 @@ fn serve_callsigns(stream: PrefixedConn, radioid: &crate::net_dashboard::radioid
         }
     }
     http_json_response(stream, 200, &serde_json::Value::Object(map).to_string());
+}
+
+/// `{"<issi>": "<name>", …}` for every operator-assigned radio name.
+fn radio_names_json(radioid: &crate::net_dashboard::radioid::RadioIdCache) -> String {
+    let mut map = serde_json::Map::new();
+    for (issi, name) in radioid.local_names() {
+        map.insert(issi.to_string(), serde_json::Value::String(name));
+    }
+    serde_json::Value::Object(map).to_string()
 }
 
 /// GET /api/update/check — compare the running build against the tip of the active OTA
