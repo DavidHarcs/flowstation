@@ -111,7 +111,9 @@ mod tests {
 
     // Independent reference vectors (Midnight Blue TETRA_crypto, Apache-2.0):
     // (SCK, SCK-VN, KSO, SCKN, SSCK).
-    const VECTORS: [([u8; 10], u16, [u8; 16], u8, [u8; 15]); 4] = [
+    /// (SCK, SCK-VN, KSO, SCKN, SSCK)
+    type Vector = ([u8; 10], u16, [u8; 16], u8, [u8; 15]);
+    const VECTORS: [Vector; 4] = [
         (
             [0; 10],
             0x0f6d,
