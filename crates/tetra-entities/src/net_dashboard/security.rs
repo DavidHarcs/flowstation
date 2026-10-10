@@ -34,6 +34,9 @@ pub struct AieEdit {
 /// Sentinel the browser sends for a key it did not change (it only ever sees a masked copy).
 pub const KEEP: &str = "keep";
 
+/// Prefix of the comment line this writer emits, so a later save removes it with the block.
+const AIE_COMMENT_MARK: &str = "# Air-interface encryption (written by the dashboard):";
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -237,7 +240,7 @@ fn header_name(trimmed: &str) -> String {
 
 /// Rewrite the security settings into the TOML text (pure; see [`write_to_toml`]).
 pub fn render_toml(original: &str, edit: &SecurityEdit) -> String {
-    // Pass 1: drop the blocks we regenerate.
+    // Pass 1: drop the blocks we regenerate, and the comment line we wrote with them.
     let mut kept: Vec<String> = Vec::new();
     let mut skipping = false;
     for line in original.lines() {
@@ -249,7 +252,7 @@ pub fn render_toml(original: &str, edit: &SecurityEdit) -> String {
                 continue;
             }
         }
-        if !skipping {
+        if !skipping && !t.starts_with(AIE_COMMENT_MARK) {
             kept.push(line.to_string());
         }
     }
@@ -262,7 +265,7 @@ pub fn render_toml(original: &str, edit: &SecurityEdit) -> String {
     if let Some(a) = &edit.aie {
         tail.extend([
             String::new(),
-            "# Air-interface encryption, security class 2 (written by the dashboard).".to_string(),
+            format!("{AIE_COMMENT_MARK} security class 2."),
             "[security.aie]".to_string(),
             format!("enabled = {}", a.enabled),
             format!("ksg = \"{}\"", a.ksg),
@@ -455,5 +458,13 @@ mod tests {
         let p = posture_json(&tetra_config::bluestation::from_toml_str(BASE).unwrap().security);
         assert!(p.to_string().contains("0000…0000"));
         assert!(!p.to_string().contains("00000000000000000000"));
+    }
+
+    #[test]
+    fn repeated_saves_do_not_accumulate_comment_lines() {
+        let once = render_toml(BASE, &edit());
+        let twice = render_toml(&once, &edit());
+        assert_eq!(once, twice, "a second save with the same settings is a no-op");
+        assert_eq!(twice.matches(AIE_COMMENT_MARK).count(), 1);
     }
 }
