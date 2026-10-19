@@ -272,6 +272,7 @@ pub enum TelemetryEvent {
     /// Progress of an over-the-air SCK delivery to a radio: "sent", "accepted", a failure
     /// text, or "timeout". Appended last for bitcode wire-stability.
     OtarSck { issi: u32, sckn: u8, sck_vn: u16, status: String },
+    OtarGck { issi: u32, gckn: u16, gck_vn: u16, status: String },
 }
 
 impl TelemetryEvent {

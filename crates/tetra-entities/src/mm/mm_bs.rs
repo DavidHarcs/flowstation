@@ -48,7 +48,7 @@ use tetra_pdus::mm::pdus::authentication::{
     UAuthenticationReject, UAuthenticationResponse, UAuthenticationResult, peek_sub_type,
 };
 use tetra_pdus::mm::pdus::otar_sck::{self, DOtarSckProvide, DOtarSckReject, OtarSessionKey, SckKeyAndIdentifier, UOtarSckDemand, UOtarSckResult};
-use tetra_pdus::mm::pdus::otar_gck::{DOtarGckProvide, GckKeyAndIdentifier, GroupAssociation};
+use tetra_pdus::mm::pdus::otar_gck::{DOtarGckProvide, GckKeyAndIdentifier, GroupAssociation, UOtarGckResult};
 use tetra_security::auth::{MsChallenge, answer_ms_challenge, derive_dck, random_nonce};
 use tetra_security::keys::AuthKey;
 use tetra_security::taa1::{ta41, ta51};
@@ -3152,6 +3152,32 @@ impl MmBs {
         }
     }
 
+    fn notify_otar_gck(&self, issi: u32, gckn: u16, gck_vn: u16, status: &str) {
+        if let Some(sink) = &self.telemetry {
+            sink.send(crate::net_telemetry::TelemetryEvent::OtarGck { issi, gckn, gck_vn, status: status.to_string() });
+        }
+    }
+
+    /// Handle a U-OTAR GCK RESULT: record each radio's accept/reject per GCK.
+    fn rx_u_otar_gck_result(&mut self, issi: u32, pdu: UOtarGckResult) {
+        for r in &pdu.results {
+            match r.result {
+                ProvisionResult::Accepted => {
+                    tracing::info!("MM: ISSI {} accepted GCK {} (version {})", issi, r.gckn, r.gck_vn);
+                    self.notify_otar_gck(issi, r.gckn, r.gck_vn, "accepted");
+                }
+                other => {
+                    let detail = match r.current_gck_vn {
+                        Some(cur) => format!("{} (radio holds version {})", other.describe(), cur),
+                        None => other.describe().to_string(),
+                    };
+                    tracing::warn!("MM: ISSI {} did not take GCK {}: {}", issi, r.gckn, detail);
+                    self.notify_otar_gck(issi, r.gckn, r.gck_vn, &format!("failed: {detail}"));
+                }
+            }
+        }
+    }
+
     /// Send the cell's SCK to one radio, sealed under a fresh session key derived from the
     /// radio's K (clause 4.5.2.2): KSO = TA41(K, RSO), SSCK = TA51(SCK, SCK-VN, KSO, SCKN).
     /// Works whether or not the cell runs class 2 yet (`class = 1` keeps the key staged), so a fleet
@@ -3325,7 +3351,11 @@ impl MmBs {
                 Ok(pdu) => self.rx_u_otar_sck_result(issi, pdu),
                 Err(e) => tracing::warn!("MM: bad U-OTAR SCK RESULT from ISSI {}: {:?}", issi, e),
             },
-            other => tracing::info!("MM: U-OTAR {} from ISSI {} not supported (only SCK OTAR is implemented)", other, issi),
+            OtarSubType::GckResultReject => match UOtarGckResult::from_bitbuf(&mut prim.sdu) {
+                Ok(pdu) => self.rx_u_otar_gck_result(issi, pdu),
+                Err(e) => tracing::warn!("MM: bad U-OTAR GCK RESULT from ISSI {}: {:?}", issi, e),
+            },
+            other => tracing::info!("MM: U-OTAR {} from ISSI {} not supported", other, issi),
         }
     }
 

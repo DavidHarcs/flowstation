@@ -2093,6 +2093,14 @@ impl DashboardServer {
                         serde_json::json!({"issi": issi, "kind": "SCK", "number": sckn, "vn": sck_vn, "status": status}).to_string(),
                     );
                 }
+                TelemetryEvent::OtarGck { issi, gckn, gck_vn, status } => {
+                    let level = if status == "accepted" || status == "sent" { "INFO" } else { "WARN" };
+                    s.push_log(level, format!("OTAR GCK {} v{} to ISSI {}: {}", gckn, gck_vn, issi, status));
+                    record_otar_result(
+                        *issi,
+                        serde_json::json!({"issi": issi, "kind": "GCK", "number": gckn, "vn": gck_vn, "status": status}).to_string(),
+                    );
+                }
                 TelemetryEvent::MsDeregistration { issi } => {
                     s.ms_map.remove(issi);
                     s.ms_security.remove(issi);
@@ -2673,6 +2681,9 @@ fn event_to_ws_msg(event: &TelemetryEvent) -> Option<String> {
         }
         TelemetryEvent::OtarSck { issi, sckn, sck_vn, status } => {
             serde_json::json!({"type":"otar_sck","issi":issi,"sckn":sckn,"sck_vn":sck_vn,"status":status})
+        }
+        TelemetryEvent::OtarGck { issi, gckn, gck_vn, status } => {
+            serde_json::json!({"type":"otar_gck","issi":issi,"gckn":gckn,"gck_vn":gck_vn,"status":status})
         }
         TelemetryEvent::GroupCallStarted {
             call_id,
