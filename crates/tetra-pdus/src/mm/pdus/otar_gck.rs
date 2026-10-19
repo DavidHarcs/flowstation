@@ -14,7 +14,8 @@ use super::otar_sck::{
     RSO_LEN, SEALED_LEN,
 };
 use crate::mm::enums::mm_pdu_type_dl::MmPduTypeDl;
-use crate::mm::enums::otar_sub_type::OtarSubType;
+use crate::mm::enums::mm_pdu_type_ul::MmPduTypeUl;
+use crate::mm::enums::otar_sub_type::{OtarSubType, ProvisionResult};
 
 /// GCK key and identifier (Table A.62): GCKN (16) ‖ GCK-VN (16) ‖ sealed GCK (120).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,9 +147,86 @@ impl DOtarGckProvide {
     }
 }
 
+/// One "GCK number and result" element (A.8.28a): GCKN, GCK-VN and the result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GckNumberAndResult {
+    pub gckn: u16,
+    pub gck_vn: u16,
+    pub result: ProvisionResult,
+    /// Present when the result is "incorrect key version number".
+    pub current_gck_vn: Option<u16>,
+}
+
+/// U-OTAR GCK RESULT (Table A.14): the MS accepts or rejects each provided GCK.
+#[derive(Debug, PartialEq, Eq)]
+pub struct UOtarGckResult {
+    pub results: Vec<GckNumberAndResult>,
+    pub address_extension: Option<u64>,
+    pub proprietary: Option<Type3FieldGeneric>,
+}
+
+impl UOtarGckResult {
+    pub fn from_bitbuf(buffer: &mut BitBuffer) -> Result<Self, PduParseErr> {
+        expect_sub_type(read_header(buffer, false)?, OtarSubType::GckResultReject)?;
+        let n = buffer.read_field(3, "number_of_gcks_provided")?;
+        let mut results = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            let gckn = buffer.read_field(16, "gckn")? as u16;
+            let gck_vn = buffer.read_field(16, "gck_vn")? as u16;
+            let result = ProvisionResult::from_raw(buffer.read_field(3, "provision_result")?);
+            let current_gck_vn = if result == ProvisionResult::IncorrectKeyVersion {
+                Some(buffer.read_field(16, "current_gck_vn")? as u16)
+            } else {
+                None
+            };
+            results.push(GckNumberAndResult { gckn, gck_vn, result, current_gck_vn });
+        }
+        let (address_extension, proprietary) = read_tail(buffer, true)?;
+        Ok(UOtarGckResult { results, address_extension, proprietary })
+    }
+
+    pub fn to_bitbuf(&self, buffer: &mut BitBuffer) -> Result<(), PduParseErr> {
+        buffer.write_bits(MmPduTypeUl::UOtar.into_raw(), 4);
+        buffer.write_bits(OtarSubType::GckResultReject.into_raw(), 4);
+        buffer.write_bits(self.results.len() as u64, 3);
+        for r in &self.results {
+            buffer.write_bits(u64::from(r.gckn), 16);
+            buffer.write_bits(u64::from(r.gck_vn), 16);
+            buffer.write_bits(r.result.into_raw(), 3);
+            if r.result == ProvisionResult::IncorrectKeyVersion {
+                buffer.write_bits(u64::from(r.current_gck_vn.unwrap_or(0)), 16);
+            }
+        }
+        write_tail(buffer, self.address_extension);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gck_result_round_trips() {
+        let pdu = UOtarGckResult {
+            results: vec![
+                GckNumberAndResult { gckn: 0x1234, gck_vn: 7, result: ProvisionResult::Accepted, current_gck_vn: None },
+                GckNumberAndResult {
+                    gckn: 0x00AB,
+                    gck_vn: 2,
+                    result: ProvisionResult::IncorrectKeyVersion,
+                    current_gck_vn: Some(5),
+                },
+            ],
+            address_extension: None,
+            proprietary: None,
+        };
+        let mut buf = BitBuffer::new_autoexpand(128);
+        pdu.to_bitbuf(&mut buf).expect("encode");
+        buf.seek(0);
+        let decoded = UOtarGckResult::from_bitbuf(&mut buf).expect("decode");
+        assert_eq!(decoded, pdu);
+    }
 
     #[test]
     fn gck_provide_round_trips() {
