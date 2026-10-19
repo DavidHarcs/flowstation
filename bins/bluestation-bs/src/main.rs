@@ -706,13 +706,38 @@ fn main() {
             dashboard.set_shared_config(cfg.clone());
 
             // Create a control link so dashboard can send commands to CMCE
-            let dash_cmd_tx = {
+            // Route dashboard commands to the right entity: OTAR and DGNA are MM
+            // procedures; everything else (SDS, live-SDS, …) is CMCE. A tiny forwarding
+            // thread fans one dashboard channel out to the correct entity dispatcher.
+            {
                 use tetra_core::tetra_entities::TetraEntity;
-                cdispatchers.get(&TetraEntity::Cmce).map(|d| d.clone_sender())
-            };
-
-            if let Some(tx) = dash_cmd_tx {
-                dashboard.set_cmd_sender(tx);
+                use tetra_entities::net_control::ControlCommand;
+                let cmce_tx = cdispatchers.get(&TetraEntity::Cmce).map(|d| d.clone_sender());
+                let mm_tx = cdispatchers.get(&TetraEntity::Mm).map(|d| d.clone_sender());
+                match (cmce_tx, mm_tx) {
+                    (Some(cmce_tx), Some(mm_tx)) => {
+                        let (dash_tx, dash_rx) = crossbeam_channel::unbounded::<ControlCommand>();
+                        let _ = std::thread::Builder::new()
+                            .name("dash-cmd-router".into())
+                            .spawn(move || {
+                                while let Ok(cmd) = dash_rx.recv() {
+                                    let to_mm = matches!(
+                                        cmd,
+                                        ControlCommand::OtarSck { .. }
+                                            | ControlCommand::OtarSckSealed { .. }
+                                            | ControlCommand::OtarGckSealed { .. }
+                                            | ControlCommand::Dgna { .. }
+                                    );
+                                    let tx = if to_mm { &mm_tx } else { &cmce_tx };
+                                    let _ = tx.send(cmd);
+                                }
+                            });
+                        dashboard.set_cmd_sender(dash_tx);
+                    }
+                    // No MM dispatcher: preserve the old CMCE-only behaviour.
+                    (Some(cmce_tx), None) => dashboard.set_cmd_sender(cmce_tx),
+                    _ => {}
+                }
             }
 
             if let Some(ref h) = lst_handle {
