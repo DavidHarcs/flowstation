@@ -21,7 +21,7 @@ pub const RSO_LEN: usize = 10;
 /// Sealed key, 120 bits (clause A.8.76).
 pub const SEALED_LEN: usize = 15;
 
-fn read_bytes<const N: usize>(buffer: &mut BitBuffer, name: &'static str) -> Result<[u8; N], PduParseErr> {
+pub(crate) fn read_bytes<const N: usize>(buffer: &mut BitBuffer, name: &'static str) -> Result<[u8; N], PduParseErr> {
     let mut out = [0u8; N];
     for b in out.iter_mut() {
         *b = buffer.read_field(8, name)? as u8;
@@ -29,13 +29,13 @@ fn read_bytes<const N: usize>(buffer: &mut BitBuffer, name: &'static str) -> Res
     Ok(out)
 }
 
-fn write_bytes(buffer: &mut BitBuffer, value: &[u8]) {
+pub(crate) fn write_bytes(buffer: &mut BitBuffer, value: &[u8]) {
     for &b in value {
         buffer.write_bits(u64::from(b), 8);
     }
 }
 
-fn read_header(buffer: &mut BitBuffer, expect_dl: bool) -> Result<OtarSubType, PduParseErr> {
+pub(crate) fn read_header(buffer: &mut BitBuffer, expect_dl: bool) -> Result<OtarSubType, PduParseErr> {
     let pdu_type = buffer.read_field(4, "pdu_type")?;
     if expect_dl {
         expect_pdu_type!(pdu_type, MmPduTypeDl::DOtar)?;
@@ -45,7 +45,7 @@ fn read_header(buffer: &mut BitBuffer, expect_dl: bool) -> Result<OtarSubType, P
     OtarSubType::try_from(buffer.read_field(4, "otar_sub_type")?)
 }
 
-fn expect_sub_type(got: OtarSubType, want: OtarSubType) -> Result<(), PduParseErr> {
+pub(crate) fn expect_sub_type(got: OtarSubType, want: OtarSubType) -> Result<(), PduParseErr> {
     if got == want {
         Ok(())
     } else {
@@ -63,7 +63,7 @@ pub fn peek_sub_type(buffer: &BitBuffer) -> Option<OtarSubType> {
 
 /// Reads the optional tail shared by these PDUs: O-bit, type-2 Address
 /// extension (24 bits), type-3 Proprietary.
-fn read_tail(buffer: &mut BitBuffer, uplink: bool) -> Result<(Option<u64>, Option<Type3FieldGeneric>), PduParseErr> {
+pub(crate) fn read_tail(buffer: &mut BitBuffer, uplink: bool) -> Result<(Option<u64>, Option<Type3FieldGeneric>), PduParseErr> {
     let mut obit = delimiters::read_obit(buffer)?;
     let address_extension = typed::parse_type2_generic(obit, buffer, 24, "address_extension")?;
     let proprietary = if uplink {
@@ -78,7 +78,7 @@ fn read_tail(buffer: &mut BitBuffer, uplink: bool) -> Result<(Option<u64>, Optio
     Ok((address_extension, proprietary))
 }
 
-fn write_tail(buffer: &mut BitBuffer, address_extension: Option<u64>) {
+pub(crate) fn write_tail(buffer: &mut BitBuffer, address_extension: Option<u64>) {
     let obit = address_extension.is_some();
     delimiters::write_obit(buffer, obit as u8);
     if !obit {

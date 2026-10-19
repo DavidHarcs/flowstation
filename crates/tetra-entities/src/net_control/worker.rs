@@ -122,6 +122,7 @@ impl<T: NetworkTransport> ControlWorker<T> {
             // SCK OTAR is an MM procedure (D-OTAR SCK PROVIDE), keyed by the subscriber's K.
             ControlCommand::OtarSck { .. } => TetraEntity::Mm,
             ControlCommand::OtarSckSealed { .. } => TetraEntity::Mm,
+            ControlCommand::OtarGckSealed { .. } => TetraEntity::Mm,
             ControlCommand::RestartService => TetraEntity::Cmce,
             ControlCommand::ShutdownService => TetraEntity::Cmce,
             ControlCommand::AddLiveSds { .. } => TetraEntity::Cmce,

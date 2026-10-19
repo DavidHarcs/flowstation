@@ -14,4 +14,5 @@ pub mod u_mm_status;
 pub mod u_tei_provide;
 
 pub mod authentication;
+pub mod otar_gck;
 pub mod otar_sck;

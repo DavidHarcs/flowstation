@@ -48,6 +48,7 @@ use tetra_pdus::mm::pdus::authentication::{
     UAuthenticationReject, UAuthenticationResponse, UAuthenticationResult, peek_sub_type,
 };
 use tetra_pdus::mm::pdus::otar_sck::{self, DOtarSckProvide, DOtarSckReject, OtarSessionKey, SckKeyAndIdentifier, UOtarSckDemand, UOtarSckResult};
+use tetra_pdus::mm::pdus::otar_gck::{DOtarGckProvide, GckKeyAndIdentifier, GroupAssociation};
 use tetra_security::auth::{MsChallenge, answer_ms_challenge, derive_dck, random_nonce};
 use tetra_security::keys::AuthKey;
 use tetra_security::taa1::{ta41, ta51};
@@ -2529,6 +2530,17 @@ impl TetraEntityTrait for MmBs {
                     } => {
                         self.otar_sck_provide_sealed(queue, issi, sckn_air, sck_vn, ksg_air, ssck, rso);
                     }
+                    ControlCommand::OtarGckSealed {
+                        issi,
+                        gckn,
+                        gck_vn,
+                        ksg_air,
+                        gssi,
+                        sgck,
+                        rso,
+                    } => {
+                        self.otar_gck_provide_sealed(queue, issi, gckn, gck_vn, ksg_air, gssi, sgck, rso);
+                    }
                     _ => {
                         tracing::warn!("MM: ignoring unsupported control command {:?}", cmd);
                     }
@@ -3242,6 +3254,55 @@ impl MmBs {
             return;
         };
         self.send_dotar_sck(queue, issi, sckn_air, sck_vn, ksg_air, ssck, rso, "kmf");
+    }
+
+    /// Transmit a GCK sealed by an external KMF (Model B) as a D-OTAR GCK
+    /// PROVIDE, associated to group `gssi`. FlowStation holds no key material.
+    #[allow(clippy::too_many_arguments)]
+    fn otar_gck_provide_sealed(
+        &mut self,
+        queue: &mut MessageQueue,
+        issi: u32,
+        gckn: u16,
+        gck_vn: u16,
+        ksg_air: u8,
+        gssi: u32,
+        sgck: Vec<u8>,
+        rso: Vec<u8>,
+    ) {
+        if !self.client_mgr.client_is_known(issi) {
+            tracing::warn!("MM: KMF-OTAR GCK to ISSI {} — radio is not registered on this cell", issi);
+            return;
+        }
+        let Ok(sgck): Result<[u8; otar_sck::SEALED_LEN], _> = sgck.try_into() else {
+            tracing::warn!("MM: KMF-OTAR GCK to ISSI {} — SGCK is not {} bytes", issi, otar_sck::SEALED_LEN);
+            return;
+        };
+        let Ok(rso): Result<[u8; otar_sck::RSO_LEN], _> = rso.try_into() else {
+            tracing::warn!("MM: KMF-OTAR GCK to ISSI {} — RSO is not {} bytes", issi, otar_sck::RSO_LEN);
+            return;
+        };
+        let pdu = DOtarGckProvide {
+            ack_required: true,
+            explicit_response: true,
+            max_response_timer: 0,
+            session_key: OtarSessionKey::Individual { rso },
+            keys: vec![GckKeyAndIdentifier { gckn, gck_vn, sgck }],
+            ksg_number: ksg_air,
+            group_association: GroupAssociation::Gssi(gssi),
+            otar_retry_interval: 0,
+            address_extension: None,
+            proprietary: None,
+        };
+        tracing::info!(
+            "MM: OTAR (kmf) — sending GCK {} v{} (GSSI {}, TEA{}) to ISSI {}",
+            gckn,
+            gck_vn,
+            gssi,
+            ksg_air + 1,
+            issi
+        );
+        self.send_auth_pdu(queue, issi, 0, "DOtarGckProvide", |b| pdu.to_bitbuf(b));
     }
 
     fn rx_u_otar(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {

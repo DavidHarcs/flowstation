@@ -2935,6 +2935,41 @@ fn serve_otar_sck(stream: PrefixedConn, body: &str, cmd_tx: &Arc<Mutex<Option<Cm
     http_json_response(stream, 200, "{\"ok\":true,\"status\":\"queued\"}");
 }
 
+/// POST /api/otar/gck — transmit a KMF-sealed GCK (Model B). Body:
+/// {"issi":N,"gckn":N,"gck_vn":N,"ksg_air":N,"gssi":N,"sgck":"<hex>","rso":"<hex>"}.
+fn serve_otar_gck(stream: PrefixedConn, body: &str, cmd_tx: &Arc<Mutex<Option<CmdSender>>>) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body.trim()) else {
+        http_json_response(stream, 200, "{\"ok\":false,\"error\":\"bad json\"}");
+        return;
+    };
+    let issi = v.get("issi").and_then(|x| x.as_u64());
+    let gckn = v.get("gckn").and_then(|x| x.as_u64());
+    let gck_vn = v.get("gck_vn").and_then(|x| x.as_u64());
+    let ksg_air = v.get("ksg_air").and_then(|x| x.as_u64());
+    let gssi = v.get("gssi").and_then(|x| x.as_u64());
+    let sgck = v.get("sgck").and_then(|x| x.as_str()).and_then(decode_hex);
+    let rso = v.get("rso").and_then(|x| x.as_str()).and_then(decode_hex);
+    let (Some(issi), Some(gckn), Some(gck_vn), Some(ksg_air), Some(gssi), Some(sgck), Some(rso)) =
+        (issi, gckn, gck_vn, ksg_air, gssi, sgck, rso)
+    else {
+        http_json_response(stream, 200, "{\"ok\":false,\"error\":\"missing or invalid fields\"}");
+        return;
+    };
+    send_control_cmd(
+        cmd_tx,
+        ControlCommand::OtarGckSealed {
+            issi: issi as u32,
+            gckn: gckn as u16,
+            gck_vn: gck_vn as u16,
+            ksg_air: ksg_air as u8,
+            gssi: gssi as u32,
+            sgck,
+            rso,
+        },
+    );
+    http_json_response(stream, 200, "{\"ok\":true,\"status\":\"queued\"}");
+}
+
 /// GET /api/sds-log — the persisted SDS Log as a JSON array, newest entry first.
 fn serve_sds_log(stream: PrefixedConn, state: &DashboardState) {
     let body = {
@@ -4087,6 +4122,9 @@ fn handle_connection(
     } else if req_line.contains("POST /api/otar/sck") {
         let (inner, body_str) = read_post_body(stream);
         serve_otar_sck(inner, &body_str, &cmd_tx);
+    } else if req_line.contains("POST /api/otar/gck") {
+        let (inner, body_str) = read_post_body(stream);
+        serve_otar_gck(inner, &body_str, &cmd_tx);
     } else if req_line.contains("GET /api/security") {
         let mut s = stream;
         drain_http_headers(&mut s);

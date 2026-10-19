@@ -53,6 +53,19 @@ pub enum ControlCommand {
         rso: Vec<u8>,
     },
 
+    /// As `OtarSckSealed`, but for a Group Cipher Key (D-OTAR GCK PROVIDE). The
+    /// KMF seals the GCK under the GSKO (TA81); FlowStation only transmits.
+    /// `gckn` is the 16-bit GCK number; the GCK is associated to group `gssi`.
+    OtarGckSealed {
+        issi: u32,
+        gckn: u16,
+        gck_vn: u16,
+        ksg_air: u8,
+        gssi: u32,
+        sgck: Vec<u8>,
+        rso: Vec<u8>,
+    },
+
     /// Dynamic Group Number Assignment (SS-DGNA, ETSI EN 300 392-2 §16).
     ///
     /// BS-initiated: attach (or detach) a single GSSI on an already-registered
