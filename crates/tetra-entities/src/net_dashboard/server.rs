@@ -2088,6 +2088,10 @@ impl DashboardServer {
                 TelemetryEvent::OtarSck { issi, sckn, sck_vn, status } => {
                     let level = if status == "accepted" || status == "sent" { "INFO" } else { "WARN" };
                     s.push_log(level, format!("OTAR SCK {} v{} to ISSI {}: {}", sckn, sck_vn, issi, status));
+                    record_otar_result(
+                        *issi,
+                        serde_json::json!({"issi": issi, "kind": "SCK", "number": sckn, "vn": sck_vn, "status": status}).to_string(),
+                    );
                 }
                 TelemetryEvent::MsDeregistration { issi } => {
                     s.ms_map.remove(issi);
@@ -2888,6 +2892,41 @@ fn send_control_cmd(cmd_tx: &Arc<Mutex<Option<CmdSender>>>, cmd: ControlCommand)
             let _ = tx.send(cmd);
         }
     }
+}
+
+/// Last OTAR result per ISSI (set from telemetry), so the KMF can poll the
+/// radio's D-OTAR RESULT after provisioning. Self-contained; survives for the
+/// process lifetime.
+static OTAR_RESULTS: std::sync::OnceLock<Mutex<std::collections::HashMap<u32, String>>> =
+    std::sync::OnceLock::new();
+
+fn otar_results() -> &'static Mutex<std::collections::HashMap<u32, String>> {
+    OTAR_RESULTS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn record_otar_result(issi: u32, json: String) {
+    if let Ok(mut m) = otar_results().lock() {
+        m.insert(issi, json);
+    }
+}
+
+/// GET /api/otar/result?issi=N — the last stored D-OTAR result for a radio, or
+/// `{"status":"pending"}` if none has arrived yet.
+fn serve_otar_result(stream: PrefixedConn, req_line: &str) {
+    let issi = req_line
+        .split("issi=")
+        .nth(1)
+        .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|s| s.parse::<u32>().ok());
+    let body = match issi {
+        Some(issi) => otar_results()
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&issi).cloned())
+            .unwrap_or_else(|| serde_json::json!({"issi": issi, "status": "pending"}).to_string()),
+        None => "{\"error\":\"missing issi\"}".to_string(),
+    };
+    http_json_response(stream, 200, &body);
 }
 
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
@@ -4125,6 +4164,10 @@ fn handle_connection(
     } else if req_line.contains("POST /api/otar/gck") {
         let (inner, body_str) = read_post_body(stream);
         serve_otar_gck(inner, &body_str, &cmd_tx);
+    } else if req_line.contains("GET /api/otar/result") {
+        let mut s = stream;
+        drain_http_headers(&mut s);
+        serve_otar_result(s, &req_line);
     } else if req_line.contains("GET /api/security") {
         let mut s = stream;
         drain_http_headers(&mut s);
