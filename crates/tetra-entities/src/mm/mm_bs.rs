@@ -3298,14 +3298,17 @@ impl MmBs {
     ) {
         if !self.client_mgr.client_is_known(issi) {
             tracing::warn!("MM: KMF-OTAR GCK to ISSI {} — radio is not registered on this cell", issi);
+            self.notify_otar_gck(issi, gckn, gck_vn, "radio not registered");
             return;
         }
         let Ok(sgck): Result<[u8; otar_sck::SEALED_LEN], _> = sgck.try_into() else {
             tracing::warn!("MM: KMF-OTAR GCK to ISSI {} — SGCK is not {} bytes", issi, otar_sck::SEALED_LEN);
+            self.notify_otar_gck(issi, gckn, gck_vn, "bad SGCK length");
             return;
         };
         let Ok(rso): Result<[u8; otar_sck::RSO_LEN], _> = rso.try_into() else {
             tracing::warn!("MM: KMF-OTAR GCK to ISSI {} — RSO is not {} bytes", issi, otar_sck::RSO_LEN);
+            self.notify_otar_gck(issi, gckn, gck_vn, "bad RSO length");
             return;
         };
         let pdu = DOtarGckProvide {
@@ -3329,6 +3332,7 @@ impl MmBs {
             issi
         );
         self.send_auth_pdu(queue, issi, 0, "DOtarGckProvide", |b| pdu.to_bitbuf(b));
+        self.notify_otar_gck(issi, gckn, gck_vn, "sent");
     }
 
     fn rx_u_otar(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
