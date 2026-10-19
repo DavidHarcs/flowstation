@@ -21,6 +21,20 @@ _Last updated: 2026-09-30, release v0.5.0 (branch `bost`)._
 | Release | README, CHANGELOG, version 0.5.0 | `6079855`, `c980acf`, `fcb0b7e` |
 | Dashboard | BTS Details shows every cell + carrier (timeslots from `/api/cells`); RF page Cells card. Not yet in CHANGELOG / no version bump | `5df20cd` |
 
+## Dual-carrier (secondary carrier) — validated on-air 2026-10-19
+
+A cell can run a `secondary_carrier` alongside `main_carrier` for extra traffic capacity. Fixed a
+registration-loop bug (`0dbff3f`, upstream PR #16): the two carriers sit only 25 kHz apart, so a
+radio's uplink burst leaks into both demodulators and its common-control random access was being
+processed on the MCCH-less secondary carrier, knocking the radio out of registration and looping it
+on re-registration; the stuck/silent calls were a downstream symptom of that instability. Fix in
+`umac_bs rx_mac_access`: on a carrier without an MCCH, ignore random access that does not belong to an
+active traffic circuit on the slot (genuine in-call FACCH/STCH), across all timeslots — the earlier
+guard only covered TS1. Common control is honoured only on the main carrier; single-carrier is
+unchanged. On-air with two radios (Pi 5 + B210, `main_carrier` 1521 + `secondary_carrier` 1522): both
+register and stay camped, registration survives restarts, and bidirectional group voice is clean on
+both radios on every key-up.
+
 ## Not validated — next step is an on-air test
 
 Nothing multi-cell has run on real SDRs or radios yet; Asterisk has only been type-checked (it needs
