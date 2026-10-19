@@ -2519,6 +2519,16 @@ impl TetraEntityTrait for MmBs {
                     ControlCommand::OtarSck { issi } => {
                         self.otar_sck_provide(queue, issi, "dashboard");
                     }
+                    ControlCommand::OtarSckSealed {
+                        issi,
+                        sckn_air,
+                        sck_vn,
+                        ksg_air,
+                        ssck,
+                        rso,
+                    } => {
+                        self.otar_sck_provide_sealed(queue, issi, sckn_air, sck_vn, ksg_air, ssck, rso);
+                    }
                     _ => {
                         tracing::warn!("MM: ignoring unsupported control command {:?}", cmd);
                     }
@@ -3156,21 +3166,82 @@ impl MmBs {
         // SCKN is 0-based on air (clause A.8.70: value 0 = SCK number 1).
         let sckn_air = aie.sckn.saturating_sub(1) & 0x1f;
         let ssck = ta51(&aie.sck.0, aie.sck_vn, &kso, sckn_air);
+        let sck_vn = aie.sck_vn;
+        let ksg_air = aie.ksg.saturating_sub(1);
+        self.send_dotar_sck(queue, issi, sckn_air, sck_vn, ksg_air, ssck, rso, why);
+    }
+
+    /// Build and transmit a D-OTAR SCK PROVIDE from already-sealed key material,
+    /// track the pending result and emit telemetry. `sckn_air`/`ksg_air` are the
+    /// 0-based on-air numbers. Shared by the config-sealed and KMF-sealed paths.
+    #[allow(clippy::too_many_arguments)]
+    fn send_dotar_sck(
+        &mut self,
+        queue: &mut MessageQueue,
+        issi: u32,
+        sckn_air: u8,
+        sck_vn: u16,
+        ksg_air: u8,
+        ssck: [u8; otar_sck::SEALED_LEN],
+        rso: [u8; otar_sck::RSO_LEN],
+        why: &str,
+    ) {
         let pdu = DOtarSckProvide {
             ack_required: true,
             explicit_response: true,
             max_response_timer: 0,
             session_key: OtarSessionKey::Individual { rso },
-            keys: vec![SckKeyAndIdentifier { sckn: sckn_air, sck_vn: aie.sck_vn, dmo: false, ssck }],
-            ksg_number: aie.ksg.saturating_sub(1),
+            keys: vec![SckKeyAndIdentifier { sckn: sckn_air, sck_vn, dmo: false, ssck }],
+            ksg_number: ksg_air,
             otar_retry_interval: 0,
             address_extension: None,
             proprietary: None,
         };
-        tracing::info!("MM: OTAR ({}) — sending {} SCK {} v{} to ISSI {}", why, format!("TEA{}", aie.ksg), aie.sckn, aie.sck_vn, issi);
+        let sckn_1based = (sckn_air & 0x1f) + 1;
+        tracing::info!(
+            "MM: OTAR ({}) — sending TEA{} SCK {} v{} to ISSI {}",
+            why,
+            ksg_air + 1,
+            sckn_1based,
+            sck_vn,
+            issi
+        );
         self.send_auth_pdu(queue, issi, 0, "DOtarSckProvide", |b| pdu.to_bitbuf(b));
-        self.otar_pending.insert(issi, PendingOtar { sckn: aie.sckn, sck_vn: aie.sck_vn, started: Instant::now() });
-        self.notify_otar(issi, aie.sckn, aie.sck_vn, "sent");
+        self.otar_pending
+            .insert(issi, PendingOtar { sckn: sckn_1based, sck_vn, started: Instant::now() });
+        self.notify_otar(issi, sckn_1based, sck_vn, "sent");
+    }
+
+    /// Transmit an SCK sealed by an external KMF (Model B). FlowStation holds no
+    /// K here — it validates lengths, checks the radio is registered, and sends.
+    #[allow(clippy::too_many_arguments)]
+    fn otar_sck_provide_sealed(
+        &mut self,
+        queue: &mut MessageQueue,
+        issi: u32,
+        sckn_air: u8,
+        sck_vn: u16,
+        ksg_air: u8,
+        ssck: Vec<u8>,
+        rso: Vec<u8>,
+    ) {
+        let sckn_1based = (sckn_air & 0x1f) + 1;
+        if !self.client_mgr.client_is_known(issi) {
+            tracing::warn!("MM: KMF-OTAR to ISSI {} — radio is not registered on this cell", issi);
+            self.notify_otar(issi, sckn_1based, sck_vn, "radio not registered");
+            return;
+        }
+        let Ok(ssck): Result<[u8; otar_sck::SEALED_LEN], _> = ssck.try_into() else {
+            tracing::warn!("MM: KMF-OTAR to ISSI {} — SSCK is not {} bytes", issi, otar_sck::SEALED_LEN);
+            self.notify_otar(issi, sckn_1based, sck_vn, "bad SSCK length");
+            return;
+        };
+        let Ok(rso): Result<[u8; otar_sck::RSO_LEN], _> = rso.try_into() else {
+            tracing::warn!("MM: KMF-OTAR to ISSI {} — RSO is not {} bytes", issi, otar_sck::RSO_LEN);
+            self.notify_otar(issi, sckn_1based, sck_vn, "bad RSO length");
+            return;
+        };
+        self.send_dotar_sck(queue, issi, sckn_air, sck_vn, ksg_air, ssck, rso, "kmf");
     }
 
     fn rx_u_otar(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {

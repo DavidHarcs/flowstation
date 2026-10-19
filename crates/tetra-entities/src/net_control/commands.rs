@@ -39,6 +39,20 @@ pub enum ControlCommand {
     /// for it under [[security.subscribers]]. Local-only.
     OtarSck { issi: u32 },
 
+    /// Transmit a D-OTAR SCK PROVIDE built from key material already sealed by an
+    /// external Key Management Facility (KMF, "Model B"). FlowStation holds no
+    /// authentication key K in this mode — it only transmits the pre-sealed PDU.
+    /// `sckn_air` and `ksg_air` are the 0-based on-air values; `ssck` is the
+    /// sealed SCK (SEALED_LEN bytes) and `rso` the seed (RSO_LEN bytes).
+    OtarSckSealed {
+        issi: u32,
+        sckn_air: u8,
+        sck_vn: u16,
+        ksg_air: u8,
+        ssck: Vec<u8>,
+        rso: Vec<u8>,
+    },
+
     /// Dynamic Group Number Assignment (SS-DGNA, ETSI EN 300 392-2 §16).
     ///
     /// BS-initiated: attach (or detach) a single GSSI on an already-registered

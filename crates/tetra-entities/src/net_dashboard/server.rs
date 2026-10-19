@@ -2890,6 +2890,51 @@ fn send_control_cmd(cmd_tx: &Arc<Mutex<Option<CmdSender>>>, cmd: ControlCommand)
     }
 }
 
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim();
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
+/// POST /api/otar/sck — transmit an SCK sealed by an external KMF (Model B).
+/// Body: {"issi":N,"sckn_air":N,"sck_vn":N,"ksg_air":N,"ssck":"<hex>","rso":"<hex>"}.
+/// FlowStation only transmits; it holds no key material in this path.
+fn serve_otar_sck(stream: PrefixedConn, body: &str, cmd_tx: &Arc<Mutex<Option<CmdSender>>>) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body.trim()) else {
+        http_json_response(stream, 200, "{\"ok\":false,\"error\":\"bad json\"}");
+        return;
+    };
+    let issi = v.get("issi").and_then(|x| x.as_u64());
+    let sckn_air = v.get("sckn_air").and_then(|x| x.as_u64());
+    let sck_vn = v.get("sck_vn").and_then(|x| x.as_u64());
+    let ksg_air = v.get("ksg_air").and_then(|x| x.as_u64());
+    let ssck = v.get("ssck").and_then(|x| x.as_str()).and_then(decode_hex);
+    let rso = v.get("rso").and_then(|x| x.as_str()).and_then(decode_hex);
+    let (Some(issi), Some(sckn_air), Some(sck_vn), Some(ksg_air), Some(ssck), Some(rso)) =
+        (issi, sckn_air, sck_vn, ksg_air, ssck, rso)
+    else {
+        http_json_response(stream, 200, "{\"ok\":false,\"error\":\"missing or invalid fields\"}");
+        return;
+    };
+    send_control_cmd(
+        cmd_tx,
+        ControlCommand::OtarSckSealed {
+            issi: issi as u32,
+            sckn_air: sckn_air as u8,
+            sck_vn: sck_vn as u16,
+            ksg_air: ksg_air as u8,
+            ssck,
+            rso,
+        },
+    );
+    http_json_response(stream, 200, "{\"ok\":true,\"status\":\"queued\"}");
+}
+
 /// GET /api/sds-log — the persisted SDS Log as a JSON array, newest entry first.
 fn serve_sds_log(stream: PrefixedConn, state: &DashboardState) {
     let body = {
@@ -4039,6 +4084,9 @@ fn handle_connection(
         tracing::info!("Dashboard: restart requested from the Security page");
         crate::service_control::schedule_service_action(crate::service_control::ServiceAction::Restart, std::time::Duration::from_secs(2));
         http_json_response(inner, 200, "{\"ok\":true}");
+    } else if req_line.contains("POST /api/otar/sck") {
+        let (inner, body_str) = read_post_body(stream);
+        serve_otar_sck(inner, &body_str, &cmd_tx);
     } else if req_line.contains("GET /api/security") {
         let mut s = stream;
         drain_http_headers(&mut s);
