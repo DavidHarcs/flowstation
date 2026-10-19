@@ -295,20 +295,18 @@ impl RxTxDev for RxTxDevSoapySdr {
         }
 
         // 2. The stack's clock has fallen behind the SDR for another reason (a stall, RX
-        //    latency): the slot it is handing us can no longer be sent. Tick it forward with an
-        //    empty slot, and skip one slot of air in the uplink demodulators at the same time so
-        //    both clocks move by one.
+        //    latency) while the air kept flowing. The slot it is handing us can no longer be
+        //    sent, so tick it forward with an empty slot until it is back in front of the SDR.
+        //    The uplink demodulators are driven by sample arrival, so here they are already on
+        //    real air-time — do NOT skip them with the stack, or they run one slot ahead of the
+        //    air for every tick and every uplink burst (registration included) lands on the
+        //    wrong slot. Case 1 above is the only situation where the demodulators lead and the
+        //    stack must be ticked to follow them.
         if let (Some(tx_dsp), Some(sdr)) = (self.tx_dsp.as_ref(), self.sdr.as_ref()) {
             let behind = tx_dsp.stack_slots_behind(sdr, tx_slot)?;
             if behind > 0 {
                 if may_warn_catch_up(&mut self.catch_up_log_next) {
-                    tracing::warn!(
-                        "Stack is {} slot(s) behind the SDR clock, ticking it forward to catch up (uplink demodulators skip one slot with it)",
-                        behind
-                    );
-                }
-                if let Some(rx_dsp) = &mut self.rx_dsp {
-                    rx_dsp.skip_ul_slot();
+                    tracing::warn!("Stack is {} slot(s) behind the SDR clock, ticking it forward to catch up", behind);
                 }
                 return Ok(Vec::new());
             }
@@ -516,13 +514,6 @@ impl RxDsp {
             .unwrap_or(0)
     }
 
-    /// Skip one slot of air in every uplink demodulator (see `rxtx_timeslot`).
-    fn skip_ul_slot(&mut self) {
-        for d in self.ul_demodulators.iter_mut() {
-            d.demodulator.skip_slot();
-        }
-    }
-
     fn take_slot_bits<'a>(&'a mut self) -> Vec<Option<RxSlotBits<'a>>> {
         // TODO: avoid dynamic allocation here?
         let mut slot_bits = Vec::with_capacity(2 * self.monitors.len() + self.ul_demodulators.len());
@@ -670,10 +661,27 @@ impl TxDsp {
             }
         }
 
+        // Multi-carrier synthesis must be atomic: every modulator contributes to the shared FCFB
+        // exactly once per block, or not at all. Previously each modulator added its contribution
+        // the moment its own block was ready; if a *later* carrier then returned "not ready" this
+        // function bailed after the earlier carriers had already committed, and on the next call
+        // those carriers committed a second time — malforming whichever carrier came first in
+        // iteration order (reversing the order moved the defect with it). razvanzeces/flowstation#51.
+        //
+        // So prepare every carrier's block first — idempotent, an already-prepared carrier is left
+        // untouched while a slower one catches up — and only once all are ready commit them
+        // together in a second pass.
+        let mut all_ready = true;
         for (modulator, tx_slot) in self.modulators.iter_mut().zip(tx_slot) {
-            if !modulator.process(&mut self.fcfb, self.block_count, tx_slot) {
-                return Ok(false);
+            if !modulator.prepare(self.block_count, tx_slot) {
+                all_ready = false;
             }
+        }
+        if !all_ready {
+            return Ok(false);
+        }
+        for modulator in &mut self.modulators {
+            modulator.commit(&mut self.fcfb, self.block_count);
         }
 
         // Cheap upfront check: if the TX monitor isn't due to emit yet, skip the
@@ -774,6 +782,10 @@ struct ModulatorChannel {
     buffer_i: usize,
     /// Modulator-rate samples per TX block.
     block_len: usize,
+    /// This carrier's block is fully modulated and waiting for the other carriers before it is
+    /// committed to the shared FCFB. Keeps `prepare` idempotent across the passes where another
+    /// carrier is still catching up, so a prepared block is never re-modulated or double-committed.
+    ready: bool,
 }
 
 impl ModulatorChannel {
@@ -798,10 +810,19 @@ impl ModulatorChannel {
             block_len,
             upconverter,
             modulator: modulator::Modulator::new(mode),
+            ready: false,
         }
     }
 
-    fn process(&mut self, fcfb: &mut fcfb::SynthesisOutputProcessor, block_count: fcfb::BlockCount, tx_slot: &TxSlotBits) -> bool {
+    /// Modulate this carrier's block into its own buffer, without touching the shared FCFB.
+    /// Returns true once the block is complete. Idempotent: a block already prepared is left as
+    /// it is, so it is safe to call again on later passes while another carrier catches up. On
+    /// `NeedMoreData` it returns false with the partially filled buffer preserved, and resumes
+    /// from there on the next call.
+    fn prepare(&mut self, block_count: fcfb::BlockCount, tx_slot: &TxSlotBits) -> bool {
+        if self.ready {
+            return true;
+        }
         let buf = self.buffer.buffer_in();
         while self.buffer_i < buf.len() {
             // TODO: include delay of FCFB in sample count
@@ -818,11 +839,19 @@ impl ModulatorChannel {
                 }
             }
         }
+        self.ready = true;
+        true
+    }
+
+    /// Commit this carrier's prepared block to the shared FCFB exactly once, then reset for the
+    /// next block. Must only be called after `prepare` has returned true for every carrier.
+    fn commit(&mut self, fcfb: &mut fcfb::SynthesisOutputProcessor, block_count: fcfb::BlockCount) {
+        debug_assert!(self.ready, "committing an unprepared modulator block");
         fcfb.add(self.upconverter.process(self.buffer.buffer(), block_count));
 
         let _ = self.buffer.prepare_for_new_samples();
         self.buffer_i = 0;
-        true
+        self.ready = false;
     }
 }
 
