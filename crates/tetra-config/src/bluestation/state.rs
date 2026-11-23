@@ -42,6 +42,9 @@ pub struct Subscriber {
     /// `None` = StayAlive / always reachable. Mirrored from MM's grant so the LLC can size its
     /// acknowledged-mode ACK grace window to a radio that only wakes periodically.
     pub ee_cycle_frames: Option<u8>,
+    /// An encrypted uplink PDU has been received from this radio during the current
+    /// registration (set by the MAC). MM uses it to confirm SwMI-initiated ciphering took.
+    pub encrypting_seen: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -115,6 +118,7 @@ impl SubscriberRegistry {
                 attached_groups: HashSet::new(),
                 encrypted: was_encrypted,
                 ee_cycle_frames: was_ee_cycle,
+                encrypting_seen: false,
             },
         );
     }
@@ -126,6 +130,7 @@ impl SubscriberRegistry {
             attached_groups: HashSet::new(),
             encrypted: false,
             ee_cycle_frames: None,
+            encrypting_seen: false,
         })
     }
 
@@ -134,6 +139,19 @@ impl SubscriberRegistry {
         if let Some(s) = self.subscribers.get_mut(&issi) {
             s.encrypted = encrypted;
         }
+    }
+
+    /// Records whether an encrypted uplink PDU has been seen from a registered radio. No-op if
+    /// unregistered.
+    pub fn set_encrypting_seen(&mut self, issi: u32, seen: bool) {
+        if let Some(s) = self.subscribers.get_mut(&issi) {
+            s.encrypting_seen = seen;
+        }
+    }
+
+    /// Whether an encrypted uplink PDU has been seen from this radio; false when unregistered.
+    pub fn encrypting_seen(&self, issi: u32) -> bool {
+        self.subscribers.get(&issi).is_some_and(|s| s.encrypting_seen)
     }
 
     /// Whether a locally registered radio is encrypted; `None` when the ISSI is not registered.

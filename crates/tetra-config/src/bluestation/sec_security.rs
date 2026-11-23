@@ -61,6 +61,13 @@ pub struct CfgSecurity {
     /// Answer a radio's own challenge (U-AUTHENTICATION DEMAND) and, when we are challenged first,
     /// also challenge back so both sides are authenticated (clause 4.1.4).
     pub mutual_authentication: bool,
+    /// `swmi_initiated_ciphering = true`: on a class 2 cell, a radio that advertises SCK
+    /// capability but registers with cipher control off is ciphered by the network anyway
+    /// (D-LOCATION UPDATE ACCEPT with the cell's ciphering parameters). Some terminals (Hytera
+    /// PT580H observed) never request ciphering themselves. MM drops the radio back to clear if
+    /// no encrypted uplink follows. Default off: EN 300 392-7 has no such case and radios that
+    /// request ciphering themselves (Motorola) do not need it.
+    pub swmi_initiated_ciphering: bool,
     /// Authentication keys by ISSI.
     pub subscribers: Vec<SubscriberKey>,
     /// ISSIs whose `k` could not be parsed (reported at startup, never silently dropped).
@@ -248,6 +255,7 @@ impl Default for CfgSecurity {
             aie: None,
             authentication: AuthenticationMode::Off,
             mutual_authentication: true,
+            swmi_initiated_ciphering: false,
             subscribers: Vec::new(),
             invalid_subscriber_keys: Vec::new(),
             e2ee: None,
@@ -334,6 +342,8 @@ pub struct CfgSecurityDto {
     pub authentication: Option<String>,
     #[serde(default)]
     pub mutual_authentication: Option<bool>,
+    #[serde(default)]
+    pub swmi_initiated_ciphering: Option<bool>,
     #[serde(default)]
     pub subscribers: Vec<SubscriberKeyDto>,
     #[serde(default)]
@@ -530,6 +540,7 @@ pub fn apply_security_patch(dto: CfgSecurityDto) -> Result<CfgSecurity, String> 
         e2ee: apply_e2ee_patch(dto.e2ee.unwrap_or_default())?,
         authentication,
         mutual_authentication: dto.mutual_authentication.unwrap_or(defaults.mutual_authentication),
+        swmi_initiated_ciphering: dto.swmi_initiated_ciphering.unwrap_or(defaults.swmi_initiated_ciphering),
         subscribers,
         invalid_subscriber_keys,
         issi_whitelist: dto.issi_whitelist,

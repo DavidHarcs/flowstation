@@ -1087,6 +1087,8 @@ impl UmacBs {
     fn note_encrypting(&mut self, addr: TetraAddress, encrypted: bool) {
         if encrypted && addr.ssi_type == SsiType::Issi && self.encrypting_reported.insert(addr.ssi) {
             tracing::info!("UMAC: ISSI {} is encrypting (first encrypted PDU under the negotiated cipher key)", addr.ssi);
+            // Let MM confirm a SwMI-initiated ciphering: the radio really does hold the key.
+            self.config.state_write().subscribers.set_encrypting_seen(addr.ssi, true);
             if let Some(sink) = &self.telemetry {
                 sink.send(TelemetryEvent::MsSecurity { issi: addr.ssi, authenticated: None, encrypting: Some(true) });
             }

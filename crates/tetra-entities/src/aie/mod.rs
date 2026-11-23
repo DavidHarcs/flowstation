@@ -70,11 +70,12 @@ pub fn posture(cfg: &StackConfig) -> String {
             a.ksg, a.class3.as_ref().unwrap().cck_id
         ),
         (Some(a), Some(_)) => format!(
-            "class 2 (EXPERIMENTAL, not yet proven on air) — TEA{} SCKN {}, clear radios allowed on {} clear group(s){}",
+            "class 2 (EXPERIMENTAL, not yet proven on air) — TEA{} SCKN {}, clear radios allowed on {} clear group(s){}{}",
             a.ksg,
             a.sckn,
             a.clear_groups.len(),
-            if a.ksg == 1 { " — WARNING: TEA1 keeps only 32 key bits and is NOT secure (research/interop only)" } else { "" }
+            if a.ksg == 1 { " — WARNING: TEA1 keeps only 32 key bits and is NOT secure (research/interop only)" } else { "" },
+            if cfg.security.swmi_initiated_ciphering { " — SwMI-initiated ciphering ON for SCK-capable radios that register clear" } else { "" }
         ),
         (Some(a), None) if !ksg_available(a.ksg) => format!(
             "class 1 (clear) — [security.aie] asks for class 2 with TEA{}, but this build has no TEA{} key stream generator",
@@ -165,13 +166,32 @@ pub enum CipherDecision {
 /// Decide how a registering radio is ciphered from what it asked for (EN 300 392-7 clause
 /// 6.6.2.1: in a class 2 cell the radio proposes KSG and SCKN; unacceptable ones are rejected).
 /// `aie` is the cell's effective setting ([`effective`]).
-pub fn registration_decision(aie: Option<&CfgAie>, cipher_control: bool, params: Option<u64>) -> CipherDecision {
+///
+/// `ms_sck_capable` is the radio's SCK bit in its class of MS and `swmi_initiated` the
+/// `[security] swmi_initiated_ciphering` switch: with both set, a class 2 cell ciphers a radio
+/// that registers with cipher control off (SwMI-initiated ciphering). Some terminals (Hytera
+/// PT580H observed) never set cipher control themselves and rely on the network to switch
+/// their SCK on; a radio that in fact holds no key is dropped back to clear by MM when no
+/// encrypted uplink follows (`INFRA_CIPHER_CONFIRM`), so a keyless radio is not left deaf.
+pub fn registration_decision(
+    aie: Option<&CfgAie>,
+    cipher_control: bool,
+    params: Option<u64>,
+    ms_sck_capable: bool,
+    swmi_initiated: bool,
+) -> CipherDecision {
     if !cipher_control {
         // Cipher control false is a class 1 registration (clause 6.6.2.1.1): the radio stays clear.
         // EN 300 392-7 has no SwMI-initiated ciphering of such a radio; it would not know the key
-        // stream is on and could not decode its own downlink.
+        // stream is on and could not decode its own downlink — unless the operator switched it on
+        // for radios that are built that way.
         if aie.is_some_and(|a| a.class3.is_some()) {
             return CipherDecision::Reject(RejectCause::RequestedCipherKeyTypeNotAvailable);
+        }
+        if let Some(a) = aie {
+            if swmi_initiated && ms_sck_capable && a.class3.is_none() {
+                return CipherDecision::Encrypted(CipheringParameters::class2(a.ksg, a.sckn));
+            }
         }
         return CipherDecision::Clear;
     }
@@ -219,6 +239,22 @@ mod tests {
     use super::*;
     use tetra_config::bluestation::CipherKey;
 
+    #[test]
+    fn swmi_initiated_ciphering_only_with_the_switch_and_capability() {
+        let a = aie();
+        let class2 = CipheringParameters::class2(a.ksg, a.sckn);
+        // Switch off: a clear registration stays clear whatever the radio can do.
+        assert_eq!(registration_decision(Some(&a), false, None, true, false), CipherDecision::Clear);
+        // Switch on, radio without SCK capability (keyless clear radio on a mixed cell): clear.
+        assert_eq!(registration_decision(Some(&a), false, None, false, true), CipherDecision::Clear);
+        // Switch on, SCK-capable radio registering clear: ciphered with the cell's parameters.
+        assert_eq!(registration_decision(Some(&a), false, None, true, true), CipherDecision::Encrypted(class2));
+        // No AIE on the cell: nothing to initiate.
+        assert_eq!(registration_decision(None, false, None, true, true), CipherDecision::Clear);
+        // A radio that asks for ciphering itself is unaffected by the switch.
+        assert_eq!(registration_decision(Some(&a), true, Some(class2.to_bits()), true, true), CipherDecision::Encrypted(class2));
+    }
+
     fn aie() -> CfgAie {
         CfgAie {
             class3: None,
@@ -254,19 +290,19 @@ mod tests {
         let ok = CipheringParameters::class2(1, 3);
         // A class 1 registration (cipher control false) stays clear on a class 2 cell, also for an
         // SCK-capable radio: EN 300 392-7 has no SwMI-initiated ciphering (clause 6.6.2.1.1).
-        assert_eq!(registration_decision(Some(&a), false, None), CipherDecision::Clear);
-        assert_eq!(registration_decision(None, true, Some(ok.to_bits())), CipherDecision::Unsupported);
-        assert_eq!(registration_decision(Some(&a), true, Some(ok.to_bits())), CipherDecision::Encrypted(ok));
+        assert_eq!(registration_decision(Some(&a), false, None, false, false), CipherDecision::Clear);
+        assert_eq!(registration_decision(None, true, Some(ok.to_bits()), false, false), CipherDecision::Unsupported);
+        assert_eq!(registration_decision(Some(&a), true, Some(ok.to_bits()), false, false), CipherDecision::Encrypted(ok));
         assert_eq!(
-            registration_decision(Some(&a), true, Some(CipheringParameters::class2(2, 3).to_bits())),
+            registration_decision(Some(&a), true, Some(CipheringParameters::class2(2, 3).to_bits()), false, false),
             CipherDecision::Reject(RejectCause::IdentifiedCipherKsgNotSupported)
         );
         assert_eq!(
-            registration_decision(Some(&a), true, Some(CipheringParameters::class2(1, 4).to_bits())),
+            registration_decision(Some(&a), true, Some(CipheringParameters::class2(1, 4).to_bits()), false, false),
             CipherDecision::Reject(RejectCause::IdentifiedCipherKeyNotAvailable)
         );
         assert_eq!(
-            registration_decision(Some(&a), true, Some(0b0000_1_00000)),
+            registration_decision(Some(&a), true, Some(0b0000_1_00000), false, false),
             CipherDecision::Reject(RejectCause::RequestedCipherKeyTypeNotAvailable)
         );
     }

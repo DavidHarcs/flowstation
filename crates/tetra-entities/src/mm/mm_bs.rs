@@ -106,6 +106,10 @@ const AUTH_PASS_GRACE: Duration = Duration::from_secs(5);
 /// Motorola) follow an accepted demand location update at once with their own roaming update and
 /// ignore a second challenge; the held update was then never answered.
 const REAUTH_HOLDOFF_ENCRYPTED: Duration = T354;
+
+/// How long a radio ciphered by SwMI initiative has to send its first encrypted uplink PDU before
+/// MM concludes it holds no usable SCK and returns it to clear.
+const INFRA_CIPHER_CONFIRM: Duration = Duration::from_secs(20);
 /// How long to wait for U-OTAR SCK RESULT after an individually addressed provide.
 const T_OTAR_RESULT: Duration = Duration::from_secs(30);
 /// Maximum time to retain a location-update ciphering transition without an LLC ACK.
@@ -148,6 +152,15 @@ pub struct MmBs {
     pending_ciphering: HashMap<u32, PendingCiphering>,
     /// Transport mode of the current registration, independent of the old active DCK.
     registration_encryption: HashMap<u32, bool>,
+    /// Radios whose pending accept ciphers them by SwMI initiative (they registered with cipher
+    /// control off); moved to `infra_cipher_watch` when that ciphering is activated.
+    infra_cipher_pending: HashSet<u32>,
+    /// SwMI-initiated ciphering activated at this instant and not yet confirmed by an encrypted
+    /// uplink PDU; dropped back to clear after `INFRA_CIPHER_CONFIRM`.
+    infra_cipher_watch: HashMap<u32, Instant>,
+    /// Radios that did not take up SwMI-initiated ciphering: left clear until their next ITSI
+    /// attach, so a keyless radio is not pushed into the dark again every registration.
+    infra_cipher_declined: HashSet<u32>,
 
     // â”€â”€ Restart recovery â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     /// On-disk cache of known terminals. `Some` only after `init_recovery` runs (i.e. when the
@@ -243,6 +256,9 @@ impl MmBs {
             otar_pending: HashMap::new(),
             pending_ciphering: HashMap::new(),
             registration_encryption: HashMap::new(),
+            infra_cipher_pending: HashSet::new(),
+            infra_cipher_watch: HashMap::new(),
+            infra_cipher_declined: HashSet::new(),
             recovery: None,
             recovery_pending: VecDeque::new(),
             recovery_attempts: HashMap::new(),
@@ -338,6 +354,14 @@ impl MmBs {
             .state_write()
             .subscribers
             .set_encrypted(issi, ciphering.is_some());
+        // SwMI-initiated ciphering just went live: give the radio INFRA_CIPHER_CONFIRM to show an
+        // encrypted uplink PDU, or it goes back to clear (see process_pending_ciphering).
+        if ciphering.is_some() && self.infra_cipher_pending.remove(&issi) {
+            self.config.state_write().subscribers.set_encrypting_seen(issi, false);
+            self.infra_cipher_watch.insert(issi, Instant::now());
+        } else if ciphering.is_none() {
+            self.infra_cipher_watch.remove(&issi);
+        }
 
         match ciphering {
             Some(params) => tracing::info!(
@@ -423,6 +447,32 @@ impl MmBs {
             }
         }
         self.group_report_in_flight.retain(|_, started| started.elapsed() < CIPHERING_ACK_TIMEOUT);
+
+        // SwMI-initiated ciphering: confirmed by the first encrypted uplink PDU, otherwise the
+        // radio evidently has no usable key and is returned to clear so it is not left deaf.
+        let mut confirmed = Vec::new();
+        let mut declined = Vec::new();
+        for (&issi, started) in &self.infra_cipher_watch {
+            if self.config.state_read().subscribers.encrypting_seen(issi) {
+                confirmed.push(issi);
+            } else if started.elapsed() >= INFRA_CIPHER_CONFIRM {
+                declined.push(issi);
+            }
+        }
+        for issi in confirmed {
+            self.infra_cipher_watch.remove(&issi);
+            tracing::info!("MM: ISSI {} took up SwMI-initiated ciphering (encrypted uplink seen)", issi);
+        }
+        for issi in declined {
+            self.infra_cipher_watch.remove(&issi);
+            self.infra_cipher_declined.insert(issi);
+            tracing::warn!(
+                "MM: ISSI {} sent nothing encrypted within {:?} of SwMI-initiated ciphering — it has no usable SCK; back to clear until its next ITSI attach",
+                issi,
+                INFRA_CIPHER_CONFIRM
+            );
+            self.apply_ciphering_state(issi, None, None);
+        }
     }
 
     /// Mark the recovery cache dirty (a flush is debounced from tick_start). No-op when recovery
@@ -721,6 +771,9 @@ impl MmBs {
         self.auth_pending.remove(&issi);
         self.auth_passed.remove(&issi);
         self.registration_authenticated.remove(&issi);
+        self.infra_cipher_pending.remove(&issi);
+        self.infra_cipher_watch.remove(&issi);
+        self.infra_cipher_declined.remove(&issi);
         self.dck.remove(&issi);
         self.auth_result_pending.remove(&issi);
         self.auth_ack_pending.remove(&issi);
@@ -1030,11 +1083,18 @@ impl MmBs {
 
         // Air interface encryption (EN 300 392-7 clause 6.5): class 2 radios register with the
         // cell's SCK; radios without AIE register in clear (mixed cell).
+        // A fresh ITSI attach gives a radio that declined SwMI-initiated ciphering another go
+        // (it may have been keyed in between).
+        if pdu.location_update_type == LocationUpdateType::ItsiAttach {
+            self.infra_cipher_declined.remove(&issi);
+        }
         let (ciphering, preferred) = {
             let cfg = self.config.config();
             let aie = crate::aie::effective(&cfg);
+            let ms_sck_capable = pdu.class_of_ms.as_ref().is_some_and(|c| c.sck_encryption);
+            let swmi_initiated = cfg.security.swmi_initiated_ciphering && !self.infra_cipher_declined.contains(&issi);
             (
-                crate::aie::registration_decision(aie, pdu.cipher_control, pdu.ciphering_parameters),
+                crate::aie::registration_decision(aie, pdu.cipher_control, pdu.ciphering_parameters, ms_sck_capable, swmi_initiated),
                 aie.map(crate::aie::preferred_parameters),
             )
         };
@@ -1374,11 +1434,27 @@ impl MmBs {
             self.sc3_cck(issi, "registration_sent");
             Some(AuthenticationDownlink { r1: true, tei_request: false, cck: Some(cck) })
         } else { None };
-        // No Security downlink element (EN 300 392-7 clause A.7.3, Table A.35a). It carries the
-        // authentication result R1 and information request flags, not the ciphering parameters, and
-        // the SwMI "shall only send" it to an MS known to support it (clauses 4.4, 4.4a). Filled with
-        // the 10-bit ciphering parameters it told an SC3 radio R1 = 0 (authentication failed) next to
-        // the Authentication downlink's R1 = 1 (why Motorola radios stopped registering).
+        // Security downlink element (EN 300 392-7 clause A.7.3, Table A.35a): it carries the
+        // authentication result R1 and information request flags, and the SwMI "shall only send"
+        // it to an MS known to support it (clauses 4.4, 4.4a). Filled with the 10-bit ciphering
+        // parameters it told an SC3 radio R1 = 0 next to the Authentication downlink's R1 = 1 and
+        // broke Motorola registrations (v0.6.3), so it is normally absent. The one exception is a
+        // SwMI-initiated ciphering (`[security] swmi_initiated_ciphering`, radio registered with
+        // cipher control off): that radio asked for nothing, and this element carrying the cell's
+        // ciphering parameters is what made such a terminal (Hytera PT580H) switch its SCK on.
+        // Radios that request ciphering themselves never take this path.
+        let infra_initiated = !pdu.cipher_control && ciphering.is_some_and(|c| !c.class3);
+        let security_downlink = if infra_initiated {
+            self.infra_cipher_pending.insert(issi);
+            ciphering.map(|params| tetra_core::typed_pdu_fields::Type3FieldGeneric {
+                field_id: 3, // MmType34ElemIdDl::SecurityDownlink
+                len: 10,
+                data: params.to_bits() as u128,
+            })
+        } else {
+            self.infra_cipher_pending.remove(&issi);
+            None
+        };
         // Build D-LOCATION UPDATE ACCEPT pdu
         let pdu_response = DLocationUpdateAccept {
             location_update_accept_type: accept_type,
@@ -1388,7 +1464,7 @@ impl MmBs {
             energy_saving_information: esi,
             scch_information_and_distribution_on_18th_frame: scch_info,
             new_registered_area: None,
-            security_downlink: None,
+            security_downlink,
             group_identity_location_accept: gila,
             default_group_attachment_lifetime: None,
             authentication_downlink,

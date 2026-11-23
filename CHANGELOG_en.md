@@ -2,6 +2,12 @@
 
 Operator notes. English version of [`CHANGELOG.md`](CHANGELOG.md) (Spanish), which the dashboard OTA reads and shows the sections after your current version from. Both files carry the same entries.
 
+## v0.6.7 — SwMI-initiated SCK ciphering, as a switch, for radios that never ask
+
+- **`[security] swmi_initiated_ciphering = true`.** On a class 2 cell, a radio that advertises SCK capability but registers with cipher control off is ciphered by the network anyway: its D-LOCATION UPDATE ACCEPT carries the cell's ciphering parameters (KSG, SCKN) in the Security downlink element and the downlink switches to the SCK after the accept is acknowledged. This is the v0.5.15 behaviour that v0.6.3 removed as absent from EN 300 392-7, now off by default and taken only by radios that registered clear, so Motorola terminals, which request ciphering themselves, never see the element that broke their authenticated registration. Hytera PT580H terminals never set cipher control: with the key loaded they follow the network's lead (proven on air 18 Nov 2026 under v0.5.15); without it they stayed deaf, which is what the next point prevents.
+- **A radio that does not take it up goes back to clear.** After the ciphering is activated the station expects an encrypted uplink PDU within 20 s. If none comes, the radio evidently holds no usable SCK: it is returned to clear, logged, and not tried again until its next ITSI attach (a power-cycle after loading the key). A keyless radio therefore loses at most 20 s instead of its whole session.
+- Shown in the startup security line ("SwMI-initiated ciphering ON …"). The MAC now records the first encrypted uplink PDU per radio in the shared subscriber state.
+
 ## v0.6.6 — TEA4 completes TETRA encryption set A
 
 - **TEA4 air-interface encryption.** The fourth key stream generator of ETSI TS 104 053-1 (clause 8) is implemented register by register like TEA1–TEA3: eight-byte output register, seven-byte cipher key register into which the 80-bit key is mixed byte by byte, the P substitution, expander, f1/f2 and BP of Figures 19–24, IV mask 56DC28E3, 35 run-up steps, one key stream byte every 19 steps. `security.aie.ksg = 4` now runs a class 2 or class 3 cell with TEA4 instead of falling back to clear, and the Security page offers TEA4 in the algorithm picker. TEA4 is the export-grade algorithm fitted to many commercial terminals (Hytera among them), which until now could not be served encrypted by this station.

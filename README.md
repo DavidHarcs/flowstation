@@ -201,7 +201,9 @@ every one checked against independent test vectors:
 - **Encryption (class 2):** the static cipher key (SCK), its number and version, the algorithm
   (**TEA1**, flagged weak — it keeps only 32 of its 80 key bits; **TEA2**; **TEA3**; **TEA4**) and the
   clear talkgroups for radios without encryption (this fork's mixed-cell policy). Radios seen
-  encrypting show a lock badge with the key they use.
+  encrypting show a lock badge with the key they use. `[security] swmi_initiated_ciphering = true`
+  additionally ciphers SCK-capable radios that register with cipher control off (Hytera PT580H
+  never requests ciphering itself); a radio that then sends nothing encrypted is returned to clear.
 - **Encryption (class 3, experimental):** each radio gets its own derived cipher key (DCK) from
   authentication with its K (mutual authentication too); group downlinks use a common cipher key
   (CCK) the station delivers sealed (TA31/TA32) with the location update accept and on request,
